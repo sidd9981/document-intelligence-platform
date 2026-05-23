@@ -206,6 +206,7 @@ class Orchestrator:
             tenant_config=state["tenant_config"],
             trace_id=state["trace_id"],
         )
+        print(f"RETRIEVAL: chunks={len(result.chunks)} errors={result.errors}")
         return {"retrieval_result": result, "cache_hit": result.cache_hit}
 
     async def _invoke_graph_agent(self, state: AgentState) -> dict:

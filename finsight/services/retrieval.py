@@ -7,12 +7,16 @@ a single ranked list ready for the reranker.
 """
 
 from __future__ import annotations
+import asyncio
 
 from finsight.models.base import Chunk
 from finsight.services.llm import embed
 from finsight.services.sparse_encoder import encode_sparse
 from finsight.services.vector_store import search_dense, search_sparse
 from finsight.telemetry.tracing import get_tracer
+
+import logging
+logger = logging.getLogger(__name__)
 
 tracer = get_tracer(__name__)
 
@@ -83,24 +87,27 @@ async def run_hybrid_search(
     Returns:
         Fused and ranked list of chunks, up to k results.
     """
-    import asyncio
 
     with tracer.start_as_current_span("retrieval.hybrid_search") as span:
         span.set_attribute("team_id", team_id)
         span.set_attribute("k", k)
 
-        dense_embedding, sparse_vector = await asyncio.gather(
-            embed(query),
-            asyncio.get_event_loop().run_in_executor(None, encode_sparse, query),
-        )
+        dense_embedding = await embed(query)
 
-        dense_results, sparse_results = await asyncio.gather(
-            search_dense(dense_embedding, team_id, k),
-            search_sparse(sparse_vector, team_id, k),
-        )
+        try:
+            sparse_vector = await asyncio.get_event_loop().run_in_executor(
+                None, encode_sparse, query
+            )
+            dense_results, sparse_results = await asyncio.gather(
+                search_dense(dense_embedding, team_id, k),
+                search_sparse(sparse_vector, team_id, k),
+            )
+            span.set_attribute("dense.results", len(dense_results))
+            span.set_attribute("sparse.results", len(sparse_results))
+            fused = reciprocal_rank_fusion([dense_results, sparse_results])
+        except Exception as e:
+            logger.warning("sparse search failed, falling back to dense-only: %s", e)
+            dense_results = await search_dense(dense_embedding, team_id, k)
+            fused = dense_results
 
-        span.set_attribute("dense.results", len(dense_results))
-        span.set_attribute("sparse.results", len(sparse_results))
-
-        fused = reciprocal_rank_fusion([dense_results, sparse_results])
         return fused[:k]

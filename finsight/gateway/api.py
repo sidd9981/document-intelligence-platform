@@ -12,6 +12,9 @@ the request body. Clients no longer declare their own identity.
 from __future__ import annotations
 from finsight.services.sparse_encoder import init_encoder, close_encoder
 from finsight.services.reranker import init_reranker, close_reranker
+from fastapi.responses import StreamingResponse
+from neo4j import AsyncGraphDatabase
+import redis.asyncio as aioredis
 
 import uuid
 from contextlib import asynccontextmanager
@@ -69,8 +72,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_encoder()
     init_reranker()
 
-    import redis.asyncio as aioredis
-    from neo4j import AsyncGraphDatabase
 
     redis_client = aioredis.from_url(
         f"redis://localhost:6379/{settings.redis.cache_db}",
@@ -174,6 +175,49 @@ async def query(
         )
 
         return result
+    
+@app.post("/query/stream")
+async def query_stream(
+    request: QueryRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> StreamingResponse:
+    """Stream the answer token by token as server-sent events.
+
+    The client receives a text/event-stream response. Each token
+    arrives as 'data: <token>\n\n'. The stream ends with
+    'data: [DONE]\n\n'. This is standard SSE format — works in
+    any browser EventSource or curl with no special client library.
+    """
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="query must not be empty")
+
+    payload = decode_token(credentials.credentials)
+    team_id = get_team_id(payload)
+    tenant_config = await _get_tenant_config(team_id)
+
+    async def event_stream():
+        from finsight.services.llm import stream_complete
+
+        system = "You are a financial analyst. Answer using only the provided context. Be concise and cite sources."
+
+        with tracer.start_as_current_span("gateway.query_stream") as span:
+            span.set_attribute("team_id", team_id)
+            span.set_attribute("query_length", len(request.query))
+
+            try:
+                async for token in stream_complete(
+                    prompt=request.query,
+                    system=system,
+                    max_tokens=tenant_config.max_output_tokens,
+                ):
+                    yield f"data: {token}\n\n"
+            except Exception as e:
+                log.error("stream error", error=str(e))
+                yield f"data: [ERROR]\n\n"
+            finally:
+                yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/health")

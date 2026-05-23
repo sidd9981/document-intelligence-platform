@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 
 from finsight.config.settings import settings
 from finsight.telemetry.tracing import get_tracer
+from collections.abc import AsyncGenerator
 
 tracer = get_tracer(__name__)
 
@@ -202,3 +203,45 @@ async def complete(
         span.set_attribute("completion_tokens", completion_tokens)
 
         return answer, prompt_tokens, completion_tokens
+
+async def stream_complete(
+    prompt: str,
+    system: str,
+    max_tokens: int,
+) -> AsyncGenerator[str, None]:
+    """Stream completion tokens as they are generated.
+
+    Yields each token string as it arrives from Ollama. The caller
+    is responsible for assembling the full answer if needed.
+    Prompt token count is estimated since streaming responses don't
+    always return usage stats mid-stream.
+
+    Args:
+        prompt: The user message content.
+        system: The system message.
+        max_tokens: Maximum tokens to generate.
+
+    Yields:
+        Token strings as they arrive.
+    """
+    client = get_client()
+
+    with tracer.start_as_current_span("llm.stream_complete") as span:
+        span.set_attribute("model", settings.ollama.model)
+        span.set_attribute("max_tokens", max_tokens)
+
+        stream = await client.chat.completions.create(
+            model=settings.ollama.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.1,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            token = chunk.choices[0].delta.content
+            if token:
+                yield token

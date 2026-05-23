@@ -22,3 +22,13 @@ def test_get_client_raises_before_init():
     """get_client() must raise RuntimeError if called before init_client()."""
     with pytest.raises(RuntimeError, match="not initialized"):
         vector_store.get_client()
+
+
+async def test_search_sparse_raises_before_init():
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await vector_store.search_sparse({100: 1.5, 200: 0.8}, "ops", k=10)
+
+
+async def test_upsert_sparse_chunks_raises_before_init():
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await vector_store.upsert_sparse_chunks([])
