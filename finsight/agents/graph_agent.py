@@ -20,6 +20,7 @@ from finsight.models.base import AgentError
 from finsight.models.graph import EntityNode, GraphResult, Relationship
 from finsight.models.tenant import TenantConfig
 from finsight.telemetry.tracing import get_tracer
+from finsight.services.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
@@ -31,8 +32,9 @@ class GraphAgent:
     Pass the Neo4j driver in so this is testable without a live instance.
     """
 
-    def __init__(self, driver: AsyncDriver) -> None:
+    def __init__(self, driver: AsyncDriver, breaker: CircuitBreaker | None = None) -> None:
         self._driver = driver
+        self._breaker = breaker or CircuitBreaker(name="neo4j", failure_threshold=5, recovery_timeout=30.0)
 
     async def query(
         self,
@@ -66,18 +68,21 @@ class GraphAgent:
                 return GraphResult(latency_ms=0.0)
 
             try:
-                async with self._driver.session() as session:
-                    nodes, relationships = await session.execute_read(
-                        _fetch_entity_subgraph,
-                        entities=entities,
-                        team_id=tenant_config.team_id,
-                    )
+                async def _run_graph():
+                    async with self._driver.session() as session:
+                        nodes, relationships = await session.execute_read(
+                            _fetch_entity_subgraph,
+                            entities=entities,
+                            team_id=tenant_config.team_id,
+                        )
+                        related_doc_ids = await session.execute_read(
+                            _fetch_related_doc_ids,
+                            entities=entities,
+                            team_id=tenant_config.team_id,
+                        )
+                        return nodes, relationships, related_doc_ids
 
-                    related_doc_ids = await session.execute_read(
-                        _fetch_related_doc_ids,
-                        entities=entities,
-                        team_id=tenant_config.team_id,
-                    )
+                nodes, relationships, related_doc_ids = await self._breaker.call(_run_graph)
 
                 cypher_executed = (
                     "MATCH (c:Company) WHERE c.ticker IN $entities "

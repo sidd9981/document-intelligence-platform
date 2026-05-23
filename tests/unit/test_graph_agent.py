@@ -8,6 +8,7 @@ scope filtering, and fallback behaviour without a live graph.
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
+from finsight.services.circuit_breaker import CircuitBreaker
 
 import pytest
 
@@ -105,3 +106,16 @@ async def test_query_latency_is_populated(
 ) -> None:
     result = await agent.query(["AAPL"], make_tenant_config(), "trace-001")
     assert result.latency_ms >= 0.0
+
+async def test_query_returns_fallback_when_circuit_open() -> None:
+    """When the breaker is open the agent must return fallback=True, not raise."""
+    mock_driver = AsyncMock()
+    mock_driver.session.side_effect = RuntimeError("neo4j down")
+    open_breaker = CircuitBreaker(name="neo4j", failure_threshold=1, recovery_timeout=9999)
+    agent = GraphAgent(driver=mock_driver, breaker=open_breaker)
+    # trip the breaker
+    await agent.query(["AAPL"], make_tenant_config(), "trace-001")
+    # now open — next call should return graceful fallback
+    result = await agent.query(["AAPL"], make_tenant_config(), "trace-002")
+    assert result.fallback is True
+    assert result.entities == []

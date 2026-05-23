@@ -15,6 +15,7 @@ from finsight.services.reranker import init_reranker, close_reranker
 from fastapi.responses import StreamingResponse
 from neo4j import AsyncGraphDatabase
 import redis.asyncio as aioredis
+from finsight.services.circuit_breaker import CircuitBreaker
 
 import uuid
 from contextlib import asynccontextmanager
@@ -85,8 +86,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     global _orchestrator
     _orchestrator = Orchestrator(
-        retrieval_agent=RetrievalAgent(redis_client=redis_client),
-        graph_agent=GraphAgent(driver=neo4j_driver),
+        retrieval_agent=RetrievalAgent(
+            redis_client=redis_client,
+            breaker=CircuitBreaker(name="qdrant", failure_threshold=5, recovery_timeout=30.0),
+        ),
+        graph_agent=GraphAgent(
+            driver=neo4j_driver,
+            breaker=CircuitBreaker(name="neo4j", failure_threshold=5, recovery_timeout=30.0),
+        ),
         synthesis_agent=SynthesisAgent(),
     )
 

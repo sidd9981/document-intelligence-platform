@@ -29,6 +29,7 @@ tracer = get_tracer(__name__)
 
 CACHE_SIMILARITY_THRESHOLD = 0.95
 
+from finsight.services.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 class RetrievalAgent:
     """Runs the retrieval pipeline for a single query.
@@ -38,8 +39,9 @@ class RetrievalAgent:
     and reuses it across requests.
     """
 
-    def __init__(self, redis_client: aioredis.Redis) -> None:
+    def __init__(self, redis_client: aioredis.Redis, breaker: CircuitBreaker | None = None) -> None:
         self._redis = redis_client
+        self._breaker = breaker or CircuitBreaker(name="qdrant", failure_threshold=5, recovery_timeout=30.0)
 
     async def retrieve(
         self,
@@ -81,7 +83,8 @@ class RetrievalAgent:
 
                 span.set_attribute("cache_hit", False)
 
-                fused_chunks = await run_hybrid_search(
+                fused_chunks = await self._breaker.call(
+                    run_hybrid_search,
                     query=query,
                     team_id=tenant_config.team_id,
                     k=50,

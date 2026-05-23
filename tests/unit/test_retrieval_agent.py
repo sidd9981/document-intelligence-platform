@@ -17,6 +17,7 @@ import pytest
 from finsight.agents.retrieval_agent import RetrievalAgent
 from finsight.models.base import Chunk, ChunkMetadata
 from finsight.models.tenant import TenantConfig
+from finsight.services.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 
 def make_tenant_config(team_id: str = "ops", retrieval_k: int = 5) -> TenantConfig:
@@ -143,3 +144,15 @@ async def test_write_cache_does_not_raise_on_redis_error(
     mock_redis.set.side_effect = RuntimeError("redis down")
     chunks = [make_chunk("a")]
     await agent.write_cache("query", "ops", chunks)
+
+async def test_retrieve_returns_fallback_when_circuit_open(agent: RetrievalAgent) -> None:
+    """When the breaker is open the agent must return empty chunks, not raise."""
+    open_breaker = CircuitBreaker(name="qdrant", failure_threshold=1, recovery_timeout=9999)
+    agent._breaker = open_breaker
+    # trip the breaker
+    with patch("finsight.agents.retrieval_agent.run_hybrid_search", new=AsyncMock(side_effect=RuntimeError("down"))):
+        await agent.retrieve("query", make_tenant_config(), "trace-001")
+    # now it's open — next call should still return graceful fallback
+    result = await agent.retrieve("query", make_tenant_config(), "trace-002")
+    assert result.chunks == []
+    assert result.errors[0].error_type == "service_unavailable"
