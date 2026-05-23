@@ -1,240 +1,184 @@
 """
-FastAPI application and query endpoint.
+FastAPI gateway.
 
-Phase 1 exposes a single endpoint: POST /query. It accepts a natural
-language question and a team_id, retrieves relevant chunks from
-Qdrant, and returns a grounded answer from the LLM.
+Phase 5 upgrade: JWT validation, orchestrator wiring, token budget
+enforcement. The Phase 1 direct dense search is replaced by the full
+LangGraph orchestrator pipeline.
 
-This is the thin end-to-end slice that proves the core loop works.
-Subsequent phases add:
-    - OAuth2 token validation (Phase 5)
-    - Multi-agent orchestration via LangGraph (Phase 4)
-    - Token budget enforcement (Phase 5)
-    - WebSocket streaming (Phase 5)
-    - MCP tool servers (Phase 5)
-
-The lifespan function handles startup and shutdown of all shared
-resources. FastAPI guarantees lifespan runs before any request is
-served and after the last request completes.
+team_id is now extracted from the JWT claims rather than passed in
+the request body. Clients no longer declare their own identity.
 """
+
+from __future__ import annotations
+from finsight.services.sparse_encoder import init_encoder, close_encoder
+from finsight.services.reranker import init_reranker, close_reranker
 
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import AsyncGenerator
 
 import structlog
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from fastapi import Form
+from fastapi.responses import JSONResponse
+import time
+import jwt
+from finsight.auth.scope_definitions import DEV_CLIENTS, TEAM_SCOPES
+from finsight.auth.token_validator import JWT_SECRET, JWT_ALGORITHM
 
+from finsight.agents.graph_agent import GraphAgent
+from finsight.agents.orchestrator import Orchestrator
+from finsight.agents.retrieval_agent import RetrievalAgent
+from finsight.agents.synthesis_agent import SynthesisAgent
+from finsight.auth.token_validator import decode_token, get_team_id
 from finsight.config.settings import settings
 from finsight.gateway.db import close_pool, get_pool, init_pool
 from finsight.models.synthesis import QueryResponse
-from finsight.services.llm import close_client, complete, embed, init_client
+from finsight.models.tenant import TenantConfig
+from finsight.services.llm import close_client, init_client
 from finsight.services.vector_store import (
     close_client as close_qdrant,
     ensure_collections_exist,
     init_client as init_qdrant,
-    search_dense,
 )
 from finsight.telemetry.tracing import get_tracer, setup_tracing
 
 log = structlog.get_logger()
 tracer = get_tracer(__name__)
+security = HTTPBearer()
+
+app = FastAPI(
+    title="FinSight",
+    description="Enterprise document intelligence platform",
+    version="0.1.0",
+)
+
+_orchestrator: Orchestrator | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Manage startup and shutdown of all shared resources.
-
-    FastAPI calls the code before yield at startup and the code
-    after yield at shutdown. This is the correct place to initialize
-    connection pools and clients — not at module import time, which
-    would run during testing and require live services.
-
-    Order matters on startup:
-        1. Tracing must be initialized first so all subsequent
-           operations are traced including pool initialization.
-        2. Database pool before any operation that writes to Postgres.
-        3. Qdrant client before ensuring collections exist.
-        4. LLM client last since it has no dependencies.
-
-    Order matters on shutdown:
-        Reverse of startup. Close dependents before dependencies.
-    """
     setup_tracing()
 
     await init_pool()
     await init_qdrant()
     await ensure_collections_exist()
     await init_client()
+    init_encoder()
+    init_reranker()
 
-    log.info(
-        "startup complete",
-        env=settings.app.env,
-        ollama_model=settings.ollama.model,
-        embedding_model=settings.ollama.embedding_model,
+    import redis.asyncio as aioredis
+    from neo4j import AsyncGraphDatabase
+
+    redis_client = aioredis.from_url(
+        f"redis://localhost:6379/{settings.redis.cache_db}",
+        decode_responses=False,
     )
 
+    neo4j_driver = AsyncGraphDatabase.driver(
+        "bolt://localhost:7687",
+        auth=("neo4j", "changeme"),
+    )
+
+    global _orchestrator
+    _orchestrator = Orchestrator(
+        retrieval_agent=RetrievalAgent(redis_client=redis_client),
+        graph_agent=GraphAgent(driver=neo4j_driver),
+        synthesis_agent=SynthesisAgent(),
+    )
+
+    log.info("startup complete", env=settings.app.env, model=settings.ollama.model)
     yield
 
     await close_client()
     await close_qdrant()
     await close_pool()
-
+    close_encoder()
+    close_reranker()
+    await neo4j_driver.close()
     log.info("shutdown complete")
 
 
-app = FastAPI(
-    title="FinSight",
-    description="Enterprise document intelligence platform",
-    version="0.1.0",
-    lifespan=lifespan,
-)
+app.router.lifespan_context = lifespan
+
+
+app.router.lifespan_context = lifespan
 
 
 class QueryRequest(BaseModel):
-    """Incoming query from a client.
-
-    team_id identifies which tenant is making the request. In Phase 1
-    this is passed directly in the request body. Phase 5 replaces this
-    with OAuth2 token validation where team_id is extracted from the
-    JWT claims — the client no longer declares their own identity.
-    """
-
     query: str
-    team_id: str
 
 
-SYSTEM_PROMPT = """You are a financial document analyst. Answer the user's
-question using only the context provided below. If the context does not
-contain enough information to answer the question, say so clearly. Do not
-use any knowledge outside of the provided context. Cite specific details
-from the context in your answer."""
-
-
-@app.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest) -> QueryResponse:
-    """Answer a natural language question about financial documents.
-
-    Retrieves relevant chunks from Qdrant using dense vector search,
-    constructs a prompt with those chunks as context, and returns the
-    LLM's answer with metadata.
-
-    In Phase 1 this endpoint does not enforce token budgets or validate
-    OAuth tokens. Those are added in Phase 5. The structure here is
-    intentionally compatible with Phase 5 — the request and response
-    models will not change, only the middleware around this handler.
-
-    Args:
-        request: Contains the query text and team_id.
-
-    Returns:
-        QueryResponse with the answer, citations placeholder,
-        faithfulness score placeholder, and request metadata.
-
-    Raises:
-        HTTPException 400: If the query is empty.
-        HTTPException 404: If no relevant context is found.
-        HTTPException 500: If the LLM call fails.
-    """
-    if not request.query.strip():
-        raise HTTPException(status_code=400, detail="query must not be empty")
-
-    trace_id = str(uuid.uuid4())
-
-    with tracer.start_as_current_span("gateway.query") as span:
-        span.set_attribute("trace_id", trace_id)
-        span.set_attribute("team_id", request.team_id)
-        span.set_attribute("query_length", len(request.query))
-
-        query_embedding = await embed(request.query)
-
-        tenant_config = await _load_tenant_config(request.team_id)
-        k = tenant_config["retrieval_k"] if tenant_config else 5
-
-        chunks = await search_dense(
-            query_embedding=query_embedding,
-            team_id=request.team_id,
-            k=k,
-        )
-
-        span.set_attribute("chunks_retrieved", len(chunks))
-
-        if not chunks:
-            raise HTTPException(
-                status_code=404,
-                detail="no relevant context found for this query",
-            )
-
-        context = "\n\n---\n\n".join(
-            f"[Source: {c.metadata.ticker} {c.metadata.filing_type} "
-            f"{c.metadata.filing_date} | Section: {c.metadata.section}]\n"
-            f"{c.content}"
-            for c in chunks
-        )
-
-        prompt = f"Context:\n{context}\n\nQuestion: {request.query}"
-
-        answer, prompt_tokens, completion_tokens = await complete(
-            prompt=prompt,
-            system=SYSTEM_PROMPT,
-            max_tokens=tenant_config["max_output_tokens"] if tenant_config else 500,
-        )
-
-        span.set_attribute("prompt_tokens", prompt_tokens)
-        span.set_attribute("completion_tokens", completion_tokens)
-
-        await _log_query(
-            trace_id=trace_id,
-            team_id=request.team_id,
-            query_text=request.query,
-            chunks_retrieved=len(chunks),
-            model_used=settings.ollama.model,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
-
-        log.info(
-            "query completed",
-            trace_id=trace_id,
-            team_id=request.team_id,
-            chunks_retrieved=len(chunks),
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
-
-        return QueryResponse(
-            trace_id=trace_id,
-            answer=answer,
-            citations=[],
-            faithfulness_score=0.0,
-            model_used=settings.ollama.model,
-            latency_ms=0.0,
-            cache_hit=False,
-        )
-
-
-async def _load_tenant_config(team_id: str) -> dict | None:
-    """Load tenant configuration from Postgres.
-
-    Returns None if the team_id is not found rather than raising
-    so the caller can fall back to defaults. Phase 5 makes this
-    mandatory — an unknown team_id will be rejected at the OAuth
-    validation layer before reaching this function.
-
-    Args:
-        team_id: The team identifier to look up.
-
-    Returns:
-        Dict with tenant config fields, or None if not found.
-    """
+async def _get_tenant_config(team_id: str) -> TenantConfig:
+    """Load TenantConfig from Postgres. Raises 404 if team not found."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM tenant_configs WHERE team_id = $1",
             team_id,
         )
-        return dict(row) if row else None
+    if not row:
+        raise HTTPException(status_code=404, detail=f"team {team_id} not configured")
+
+    return TenantConfig(
+        team_id=row["team_id"],
+        daily_token_budget=row["daily_token_budget"],
+        max_context_tokens=row["max_context_tokens"],
+        max_output_tokens=row["max_output_tokens"],
+        requests_per_minute=row["requests_per_minute"],
+        priority=row["priority"],
+        allowed_models=row["allowed_models"],
+        retrieval_k=row["retrieval_k"],
+        data_scopes=row["data_scopes"],
+    )
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query(
+    request: QueryRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> QueryResponse:
+    """Answer a natural language question about financial documents.
+
+    Validates the JWT, loads tenant config, and runs the full
+    orchestrator pipeline. Returns a cited, auditable answer.
+    """
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="query must not be empty")
+
+    payload = decode_token(credentials.credentials)
+    team_id = get_team_id(payload)
+    tenant_config = await _get_tenant_config(team_id)
+
+    with tracer.start_as_current_span("gateway.query") as span:
+        span.set_attribute("team_id", team_id)
+        span.set_attribute("query_length", len(request.query))
+
+        if _orchestrator is None:
+            raise HTTPException(status_code=503, detail="orchestrator not initialized")
+
+        result = await _orchestrator.run(
+            query=request.query,
+            tenant_config=tenant_config,
+        )
+
+        await _log_query(
+            trace_id=result.trace_id,
+            team_id=team_id,
+            query_text=request.query,
+            chunks_retrieved=len(result.citations),
+            model_used=result.model_used,
+            total_tokens=0,
+        )
+
+        return result
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "env": settings.app.env}
 
 
 async def _log_query(
@@ -245,22 +189,7 @@ async def _log_query(
     model_used: str,
     total_tokens: int,
 ) -> None:
-    """Write a query record to the audit log.
-
-    Fire-and-forget — logged after the response is constructed so
-    logging latency does not affect the user-facing response time.
-    Failures are caught and logged but do not raise to the caller.
-
-    Args:
-        trace_id: The request trace ID.
-        team_id: The requesting team.
-        query_text: The original query string.
-        chunks_retrieved: Number of chunks returned by retrieval.
-        model_used: The LLM model name used for this query.
-        total_tokens: Total tokens consumed by this query.
-    """
     try:
-        import uuid as uuid_module
         pool = get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -271,25 +200,45 @@ async def _log_query(
                     model_used, total_tokens, status
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
-                uuid_module.UUID(trace_id),
+                uuid.UUID(trace_id),
                 team_id,
                 query_text,
-                "dense",
+                "hybrid",
                 chunks_retrieved,
                 model_used,
                 total_tokens,
                 "success",
             )
     except Exception as exc:
-        log.error("failed to write audit log", error=str(exc), trace_id=trace_id)
+        log.error("failed to write audit log", error=str(exc))
 
+@app.post("/oauth/token")
+async def issue_token(
+    grant_type: str = Form(...),
+    client_id: str = Form(...),
+    client_secret: str = Form(...),
+) -> JSONResponse:
+    if grant_type != "client_credentials":
+        raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
-@app.get("/health")
-async def health() -> dict:
-    """Health check endpoint.
+    expected_secret = DEV_CLIENTS.get(client_id)
+    if not expected_secret or expected_secret != client_secret:
+        raise HTTPException(status_code=401, detail="invalid_client")
 
-    Returns 200 if the application is running. Does not check
-    downstream service health — that is the responsibility of
-    the Docker health checks on each service container.
-    """
-    return {"status": "ok", "env": settings.app.env}
+    scopes = TEAM_SCOPES.get(client_id, [])
+    now = int(time.time())
+    payload = {
+        "sub": f"team_{client_id}",
+        "team_id": client_id,
+        "scopes": scopes,
+        "iat": now,
+        "exp": now + 3600,
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    return JSONResponse({
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "scope": " ".join(scopes),
+    })
