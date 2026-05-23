@@ -17,6 +17,7 @@ import uuid
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from finsight.services.metrics import faithfulness_score, tokens_used_total
 
 from finsight.agents.graph_agent import GraphAgent
 from finsight.agents.retrieval_agent import RetrievalAgent
@@ -305,8 +306,16 @@ class Orchestrator:
         synthesis = state["synthesis_result"]
         warning = None
 
-        if synthesis and synthesis.faithfulness_score < 0.85:
-            warning = f"Low confidence answer. Unsupported claims: {', '.join(synthesis.unsupported_claims[:3])}"
+        if synthesis:
+            faithfulness_score.labels(team_id=state["team_id"]).set(synthesis.faithfulness_score)
+            if synthesis.tokens_used > 0:
+                tokens_used_total.labels(
+                    team_id=state["team_id"],
+                    model=synthesis.model_used,
+                ).inc(synthesis.tokens_used)
+
+            if synthesis.faithfulness_score < 0.85:
+                warning = f"Low confidence answer. Unsupported claims: {', '.join(synthesis.unsupported_claims[:3])}"
 
         response = QueryResponse(
             trace_id=state["trace_id"],

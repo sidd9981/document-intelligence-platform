@@ -25,6 +25,7 @@ import time
 from enum import Enum
 
 from finsight.telemetry.tracing import get_tracer
+from finsight.services.metrics import circuit_breaker_opens_total
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
@@ -70,6 +71,7 @@ class CircuitBreaker:
         self._failure_count = 0
         self._opened_at: float | None = None
         self._lock = asyncio.Lock()
+        
 
     @property
     def state(self) -> CircuitState:
@@ -123,14 +125,16 @@ class CircuitBreaker:
                 exc,
             )
             if self._failure_count >= self.failure_threshold:
-                if self._state != CircuitState.OPEN:
+                just_opened = self._state != CircuitState.OPEN
+                self._state = CircuitState.OPEN
+                self._opened_at = time.monotonic()
+                if just_opened:
                     logger.error(
                         "circuit %r opened after %d failures",
                         self.name,
                         self._failure_count,
                     )
-                self._state = CircuitState.OPEN
-                self._opened_at = time.monotonic()
+                    circuit_breaker_opens_total.labels(name=self.name).inc()
 
     async def reset(self) -> None:
         """Force the circuit closed. Used in tests and manual recovery."""

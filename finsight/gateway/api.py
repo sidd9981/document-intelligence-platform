@@ -20,6 +20,7 @@ from finsight.services.circuit_breaker import CircuitBreaker
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+import time as _time
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException
@@ -48,6 +49,10 @@ from finsight.services.vector_store import (
     init_client as init_qdrant,
 )
 from finsight.telemetry.tracing import get_tracer, setup_tracing
+from prometheus_client import make_asgi_app
+from finsight.services.metrics import (
+    query_latency, cache_hits_total, cache_misses_total
+)
 
 log = structlog.get_logger()
 tracer = get_tracer(__name__)
@@ -58,6 +63,9 @@ app = FastAPI(
     description="Enterprise document intelligence platform",
     version="0.1.0",
 )
+
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 _orchestrator: Orchestrator | None = None
 
@@ -148,17 +156,15 @@ async def query(
     request: QueryRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> QueryResponse:
-    """Answer a natural language question about financial documents.
-
-    Validates the JWT, loads tenant config, and runs the full
-    orchestrator pipeline. Returns a cited, auditable answer.
-    """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
     payload = decode_token(credentials.credentials)
     team_id = get_team_id(payload)
     tenant_config = await _get_tenant_config(team_id)
+
+    start = _time.perf_counter()
+    status = "success"
 
     with tracer.start_as_current_span("gateway.query") as span:
         span.set_attribute("team_id", team_id)
@@ -167,10 +173,21 @@ async def query(
         if _orchestrator is None:
             raise HTTPException(status_code=503, detail="orchestrator not initialized")
 
-        result = await _orchestrator.run(
-            query=request.query,
-            tenant_config=tenant_config,
-        )
+        try:
+            result = await _orchestrator.run(
+                query=request.query,
+                tenant_config=tenant_config,
+            )
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            latency = _time.perf_counter() - start
+            query_latency.labels(team_id=team_id, intent="unknown", status=status).observe(latency)
+            if result and result.cache_hit:
+                cache_hits_total.labels(team_id=team_id).inc()
+            else:
+                cache_misses_total.labels(team_id=team_id).inc()
 
         await _log_query(
             trace_id=result.trace_id,
