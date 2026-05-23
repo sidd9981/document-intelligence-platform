@@ -1,0 +1,137 @@
+[
+    {
+      "id": "ops-001",
+      "team": "ops",
+      "intent": "factual",
+      "query": "How does Apple describe competition in its filings?",
+      "expected_answer_contains": ["competition", "substantial", "resources"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1"]
+    },
+    {
+      "id": "ops-002",
+      "team": "ops",
+      "intent": "factual",
+      "query": "What risks does Apple face from international operations?",
+      "expected_answer_contains": ["international", "risk", "operations"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "ops-003",
+      "team": "ops",
+      "intent": "factual",
+      "query": "What third party manufacturers does Apple depend on?",
+      "expected_answer_contains": ["manufacturers", "suppliers", "third-party"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "ops-004",
+      "team": "ops",
+      "intent": "factual",
+      "query": "What products does Apple make?",
+      "expected_answer_contains": ["iPhone", "Mac", "iPad"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1"]
+    },
+    {
+      "id": "ops-005",
+      "team": "ops",
+      "intent": "factual",
+      "query": "What are Apple main product categories?",
+      "expected_answer_contains": ["iPhone", "Services", "Mac"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1"]
+    },
+    {
+      "id": "risk-001",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What regulatory risks does Apple disclose?",
+      "expected_answer_contains": ["regulatory", "laws", "compliance"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "risk-002",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What are Apple key personnel risks?",
+      "expected_answer_contains": ["key", "personnel", "executives"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "risk-003",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What cybersecurity risks does Apple disclose?",
+      "expected_answer_contains": ["security", "data", "breach"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "risk-004",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What intellectual property risks does Apple face?",
+      "expected_answer_contains": ["intellectual property", "patents", "litigation"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "risk-005",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What macroeconomic risks does Apple disclose in its annual filing?",
+      "expected_answer_contains": ["economic", "consumer", "demand"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "analysis-001",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "How does Apple describe its competitive position in the smartphone market?",
+      "expected_answer_contains": ["competition", "iPhone", "market"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1"]
+    },
+    {
+      "id": "analysis-002",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "What supply chain concentration risks does Apple disclose?",
+      "expected_answer_contains": ["supplier", "concentration", "sole-source"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "analysis-003",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "How does Apple describe its services business?",
+      "expected_answer_contains": ["Services", "revenue", "growth"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1"]
+    },
+    {
+      "id": "analysis-004",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "What risks does Apple face in China?",
+      "expected_answer_contains": ["China", "international", "operations"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "analysis-005",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "How does Apple describe risks from dependence on third party software platforms?",
+      "expected_answer_contains": ["platform", "software", "third-party"],
+      "expected_source_filing_types": ["10-K"],
+      "expected_sections": ["Item 1A"]
+    }
+  ]

@@ -138,7 +138,7 @@ class EdgarProducer:
 
             # EDGAR's company tickers JSON is the reliable lookup
             tickers_response = await self._http.get(
-                f"{EDGAR_BASE}/files/company_tickers.json"
+                "https://www.sec.gov/files/company_tickers.json"
             )
             tickers_response.raise_for_status()
             tickers_data = tickers_response.json()
@@ -187,7 +187,7 @@ class EdgarProducer:
 
                 accession_no_dashes = accession.replace("-", "")
                 source_url = (
-                    f"{EDGAR_BASE}/Archives/edgar/data/{int(cik)}/"
+                    f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
                     f"{accession_no_dashes}/{primary_doc}"
                 )
 
