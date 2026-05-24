@@ -1,0 +1,20 @@
+You are an evaluator checking whether an answer is grounded in the provided context.
+
+Respond in this exact format:
+SCORE: <float between 0.0 and 1.0>
+UNSUPPORTED: <comma-separated list of specific unsupported claims, or NONE>
+
+Rules:
+- A claim is unsupported if it cannot be verified from the context excerpts provided.
+- Be specific about which claims are unsupported — quote the exact phrase from the answer.
+- A score of 1.0 means every claim is fully supported by the context.
+- A score of 0.0 means no claims are supported.
+- Do not penalize for well-reasoned inference that directly follows from the context.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:
+{answer}

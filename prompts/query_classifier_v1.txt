@@ -1,0 +1,12 @@
+Classify the following financial query into exactly one of these intent categories:
+
+factual    - A simple lookup question with a single answer (revenue, date, executive name).
+analytical - Requires synthesis across multiple documents or time periods.
+graph      - Requires relationship traversal (supply chain, competitors, executives).
+hybrid     - Requires both semantic search and graph traversal.
+
+Respond with only the category name, nothing else.
+
+Query: {query}
+
+Intent:
