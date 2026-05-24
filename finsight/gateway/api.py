@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from neo4j import AsyncGraphDatabase
 import redis.asyncio as aioredis
 from finsight.services.circuit_breaker import CircuitBreaker
+from finsight.services.guardrails import check_query
 
 import uuid
 from contextlib import asynccontextmanager
@@ -159,6 +160,16 @@ async def query(
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
+    guardrail = check_query(request.query)
+    if not guardrail.allowed:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": guardrail.reason,
+                "violation_type": guardrail.violation_type,
+            },
+        )
+
     payload = decode_token(credentials.credentials)
     team_id = get_team_id(payload)
     tenant_config = await _get_tenant_config(team_id)
@@ -217,6 +228,16 @@ async def query_stream(
     """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
+    
+    guardrail = check_query(request.query)
+    if not guardrail.allowed:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": guardrail.reason,
+                "violation_type": guardrail.violation_type,
+            },
+        )
 
     payload = decode_token(credentials.credentials)
     team_id = get_team_id(payload)
