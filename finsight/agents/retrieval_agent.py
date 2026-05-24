@@ -23,6 +23,8 @@ from finsight.services.reranker import rerank
 from finsight.services.retrieval import run_hybrid_search
 from finsight.telemetry.tracing import get_tracer
 import time
+import json
+import hashlib
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
@@ -138,26 +140,17 @@ class RetrievalAgent:
                     )],
                 )
 
-    async def _check_cache(
-        self,
-        query: str,
-        team_id: str,
-    ) -> list[Chunk] | None:
-        """Check Redis for a cached result for a semantically similar query.
-
-        Uses exact key lookup for now. Phase 5 upgrades this to cosine
-        similarity search across stored query embeddings for true
-        semantic cache hits.
-
-        Returns the cached chunks if found, None otherwise.
-        """
-        import json
-        import hashlib
+    async def _check_cache(self, query: str, team_id: str) -> list[Chunk] | None:
 
         cache_key = f"cache:{team_id}:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+        print(f"CACHE LOOKUP key={cache_key}", flush=True)
+        cached_raw = await self._redis.get(cache_key)
+        print(f"CACHE RAW result={cached_raw is not None}", flush=True)
+        logger.info("cache lookup key=%s", cache_key)
 
         try:
             cached = await self._redis.get(cache_key)
+            logger.info("cache result=%s", "hit" if cached else "miss")
             if cached:
                 data = json.loads(cached)
                 return [Chunk(**c) for c in data]

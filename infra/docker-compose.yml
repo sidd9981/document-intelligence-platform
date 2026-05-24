@@ -122,6 +122,8 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
     depends_on:
       prometheus:
         condition: service_healthy
@@ -137,7 +139,7 @@ services:
     image: ghcr.io/mlflow/mlflow:latest
     profiles: ["observability", "full"]
     ports:
-      - "5000:5000"
+      - "5001:5000"
     command: >
       mlflow server
       --host 0.0.0.0

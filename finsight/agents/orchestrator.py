@@ -167,6 +167,13 @@ class Orchestrator:
             synthesis = final_state.get("synthesis_result")
             retrieval = final_state.get("retrieval_result")
 
+            if synthesis and retrieval and retrieval.chunks and not retrieval.cache_hit:
+                await self._retrieval_agent.write_cache(
+                    query=query,
+                    team_id=tenant_config.team_id,
+                    chunks=retrieval.chunks,
+                )
+
             if synthesis and retrieval:
                 asyncio.create_task(
                     maybe_run_eval(

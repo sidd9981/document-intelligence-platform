@@ -184,9 +184,12 @@ async def query(
         finally:
             latency = _time.perf_counter() - start
             query_latency.labels(team_id=team_id, intent="unknown", status=status).observe(latency)
-            if result and result.cache_hit:
-                cache_hits_total.labels(team_id=team_id).inc()
-            else:
+            try:
+                if result and result.cache_hit:
+                    cache_hits_total.labels(team_id=team_id).inc()
+                else:
+                    cache_misses_total.labels(team_id=team_id).inc()
+            except UnboundLocalError:
                 cache_misses_total.labels(team_id=team_id).inc()
 
         await _log_query(

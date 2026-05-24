@@ -50,7 +50,7 @@ class Chunk(BaseModel):
     chunk_id: str
     doc_id: str
     content: str
-    score: float = Field(ge=0.0, le=1.0)
+    score: float 
     token_count: int = Field(gt=0)
     metadata: ChunkMetadata
 
