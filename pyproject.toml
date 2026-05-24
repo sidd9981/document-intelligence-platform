@@ -27,6 +27,7 @@ dependencies = [
     "psycopg2-binary>=2.9.0",
     "PyJWT>=2.8.0",
     "prometheus-client>=0.20.0",
+    "langfuse>=2.0.0",
 ]
 
 [project.optional-dependencies]

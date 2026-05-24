@@ -18,6 +18,8 @@ from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from finsight.services.metrics import faithfulness_score, tokens_used_total
+import asyncio
+from finsight.harness.eval_harness import maybe_run_eval
 
 from finsight.agents.graph_agent import GraphAgent
 from finsight.agents.retrieval_agent import RetrievalAgent
@@ -143,11 +145,7 @@ class Orchestrator:
 
         return builder.compile()
 
-    async def run(
-        self,
-        query: str,
-        tenant_config: TenantConfig,
-    ) -> QueryResponse:
+    async def run(self, query: str, tenant_config: TenantConfig) -> QueryResponse:
         """Run the full request lifecycle and return a response.
 
         Args:
@@ -165,6 +163,20 @@ class Orchestrator:
 
             state = _initial_state(query, tenant_config, trace_id)
             final_state = await self._graph.ainvoke(state)
+
+            synthesis = final_state.get("synthesis_result")
+            retrieval = final_state.get("retrieval_result")
+
+            if synthesis and retrieval:
+                asyncio.create_task(
+                    maybe_run_eval(
+                        query=query,
+                        result=synthesis,
+                        chunks=retrieval.chunks,
+                        trace_id=trace_id,
+                        team_id=tenant_config.team_id,
+                    )
+                )
 
             if final_state["final_response"]:
                 return final_state["final_response"]

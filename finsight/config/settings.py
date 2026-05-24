@@ -165,6 +165,17 @@ class AppSettings(BaseSettings):
         extra="ignore",
     )
 
+class LangfuseSettings(BaseSettings):
+    public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
+    secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")
+    host: str = Field(default="https://cloud.langfuse.com", alias="LANGFUSE_HOST")
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
 
 class Settings:
     """Root settings object. Import and use this everywhere.
@@ -188,6 +199,7 @@ class Settings:
         self.ollama = OllamaSettings()
         self.otel = OtelSettings()
         self.app = AppSettings()
+        self.langfuse = LangfuseSettings()
 
 
 settings = Settings()
