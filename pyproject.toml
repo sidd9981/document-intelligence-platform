@@ -58,6 +58,11 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-m 'not eval and not chaos'"
+markers = [
+    "eval: requires live services and golden dataset",
+    "chaos: chaos engineering tests requiring full stack",
+]
 
 [tool.mypy]
 python_version = "3.12"

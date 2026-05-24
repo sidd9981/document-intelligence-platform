@@ -143,14 +143,9 @@ class RetrievalAgent:
     async def _check_cache(self, query: str, team_id: str) -> list[Chunk] | None:
 
         cache_key = f"cache:{team_id}:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
-        print(f"CACHE LOOKUP key={cache_key}", flush=True)
-        cached_raw = await self._redis.get(cache_key)
-        print(f"CACHE RAW result={cached_raw is not None}", flush=True)
-        logger.info("cache lookup key=%s", cache_key)
 
         try:
             cached = await self._redis.get(cache_key)
-            logger.info("cache result=%s", "hit" if cached else "miss")
             if cached:
                 data = json.loads(cached)
                 return [Chunk(**c) for c in data]

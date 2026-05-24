@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests/
+*.md
+infra/
+prompts/
+.github/
+mlflow.db
