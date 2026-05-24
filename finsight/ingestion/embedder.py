@@ -19,6 +19,9 @@ from datetime import date
 from finsight.config.settings import settings
 from finsight.ingestion.chunkers.news_chunker import chunk_news_article
 from finsight.ingestion.chunkers.sec_chunker import chunk_sec_filing
+from finsight.gateway.db import get_pool
+from finsight.ingestion.entity_extractor import EntityExtractor
+from finsight.ingestion.stream_backend import STREAM_ENTITIES
 from finsight.ingestion.chunkers.transcript_chunker import chunk_transcript
 from finsight.ingestion.stream_backend import (
     GROUP_EMBEDDERS,
@@ -107,6 +110,31 @@ class EmbeddingWorker:
 
             span.set_attribute("chunks.embedded", embedded_count)
             logger.info("embedded %d chunks for doc %s", embedded_count, doc_id)
+
+            await self._extract_and_publish_entities(data, doc_id)
+
+
+    async def _extract_and_publish_entities(self, data: dict, doc_id: str) -> None:
+        """Extract entities from the document and publish to extracted:entities."""
+        try:
+            pool = get_pool()
+            extractor = EntityExtractor(backend=self._backend, db_pool=pool)
+            entities = await extractor.process_document(
+                doc_id=doc_id,
+                text=data.get("text", ""),
+                ticker=data.get("ticker", ""),
+            )
+            await extractor.publish_entities(
+                doc_id=doc_id,
+                ticker=data.get("ticker", ""),
+                filing_type=data.get("filing_type", ""),
+                filing_date=data.get("filing_date", ""),
+                scopes=data.get("scopes", ["public"]),
+                entities=entities,
+            )
+            logger.info("extracted %d entities for doc %s", len(entities), doc_id)
+        except Exception as e:
+            logger.error("entity extraction failed for doc %s: %s", doc_id, e)
 
     async def _embed_and_publish_batch(
         self,
