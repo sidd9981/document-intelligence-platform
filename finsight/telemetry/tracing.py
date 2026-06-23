@@ -20,6 +20,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
 from finsight.config.settings import settings
+import sys
 
 
 def setup_tracing() -> None:
@@ -52,7 +53,9 @@ def setup_tracing() -> None:
     provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
 
     if settings.app.env == "development":
-        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+        provider.add_span_processor(
+            BatchSpanProcessor(ConsoleSpanExporter(out=sys.stderr))
+        )
 
     trace.set_tracer_provider(provider)
 

@@ -52,6 +52,7 @@ async def init_pool() -> None:
 
         _pool = await asyncpg.create_pool(
             dsn=settings.postgres.dsn,
+            ssl=False,
             min_size=2,
             max_size=10,
             command_timeout=30,

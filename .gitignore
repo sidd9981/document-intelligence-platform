@@ -37,4 +37,5 @@ mlflow.db
 *.onnx
 
 Claude_context.md
-decision_log.md
+decision_log.md.venv-eval/
+node_modules/

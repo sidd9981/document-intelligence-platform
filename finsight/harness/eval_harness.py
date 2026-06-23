@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
 
-EVAL_SAMPLE_RATE = 0.10
+EVAL_SAMPLE_RATE = 1.0
 
 _langfuse: Langfuse | None = None
 
