@@ -1,2 +1,4 @@
-context_recall: 0.70
-answer_keyword_match: 0.60
+context_precision: 0.60
+context_recall: 0.60
+faithfulness: 0.75
+answer_relevancy: 0.60

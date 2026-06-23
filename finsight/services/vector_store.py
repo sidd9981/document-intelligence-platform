@@ -22,6 +22,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchAny,
+    MatchValue,
     PointStruct,
     SparseVector,
     SparseVectorParams,
@@ -132,17 +133,12 @@ async def ensure_collections_exist() -> None:
 async def upsert_chunks(chunks: list[dict]) -> None:
     """Write chunks to the dense vector collection.
 
-    Args:
-        chunks: List of dicts, each containing:
-            - chunk_id: unique identifier string
-            - embedding: list of floats
-            - content: raw text
-            - metadata: dict matching ChunkMetadata fields
+    Uses upsert semantics — running the same document through ingestion
+    twice produces identical chunk IDs and overwrites rather than
+    duplicating entries.
 
-    Uses upsert semantics — if a chunk with the same ID already
-    exists it is overwritten. This makes ingestion idempotent: running
-    the same document through the pipeline twice does not create
-    duplicate entries.
+    Args:
+        chunks: List of dicts with chunk_id, embedding, content, metadata.
     """
     client = get_client()
 
@@ -170,90 +166,15 @@ async def upsert_chunks(chunks: list[dict]) -> None:
         span.set_attribute("collection", settings.qdrant.collection_dense)
 
 
-async def search_dense(
-    query_embedding: list[float],
-    team_id: str,
-    k: int,
-) -> list[Chunk]:
-    """Search the dense vector collection.
-
-    Applies a mandatory scope filter so results are restricted to
-    documents the requesting team is authorized to see. This filter
-    is not optional and cannot be bypassed by callers.
-
-    Args:
-        query_embedding: The embedded query vector.
-        team_id: The requesting team. Used to filter by scopes.
-        k: Maximum number of results to return.
-
-    Returns:
-        List of Chunk objects sorted by descending relevance score.
-    """
-    client = get_client()
-
-    with tracer.start_as_current_span("qdrant.search_dense") as span:
-        span.set_attribute("team_id", team_id)
-        span.set_attribute("k", k)
-
-        scope_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="scopes",
-                    match=MatchAny(any=[team_id, "public"]),
-                )
-            ]
-        )
-
-        results = await client.query_points(
-        collection_name=settings.qdrant.collection_dense,
-        query=query_embedding,
-        query_filter=scope_filter,
-        limit=k,
-        with_payload=True,
-    )
-
-    span.set_attribute("results.count", len(results.points))
-
-    chunks = []
-    for result in results.points:
-        payload = result.payload or {}
-        chunks.append(
-            Chunk(
-                chunk_id=str(result.id),
-                doc_id=payload.get("doc_id", ""),
-                content=payload.get("content", ""),
-                score=result.score,
-                token_count=payload.get("token_count", 0),
-                metadata=ChunkMetadata(
-                    doc_id=payload.get("doc_id", ""),
-                    ticker=payload.get("ticker", ""),
-                    company_name=payload.get("company_name", ""),
-                    filing_type=payload.get("filing_type", "10-K"),
-                    filing_date=payload.get("filing_date", "2024-01-01"),
-                    section=payload.get("section", ""),
-                    chunk_index=payload.get("chunk_index", 0),
-                    token_count=payload.get("token_count", 0),
-                    embedding_model=payload.get("embedding_model", ""),
-                    scopes=payload.get("scopes", ["public"]),
-                ),
-            )
-        )
-
-    return chunks
-
 async def upsert_sparse_chunks(chunks: list[dict]) -> None:
     """Write chunks to the sparse vector collection.
 
     Same structure as upsert_chunks but stores SPLADE sparse vectors
-    instead of dense embeddings. The sparse collection is queried
-    in parallel with the dense collection during hybrid retrieval.
+    instead of dense embeddings. Queried in parallel with the dense
+    collection during hybrid retrieval.
 
     Args:
-        chunks: List of dicts, each containing:
-            - chunk_id: unique identifier string
-            - sparse_vector: dict of {token_id: weight} from SPLADE
-            - content: raw text
-            - metadata: dict matching ChunkMetadata fields
+        chunks: List of dicts with chunk_id, sparse_vector, content, metadata.
     """
     client = get_client()
 
@@ -284,20 +205,125 @@ async def upsert_sparse_chunks(chunks: list[dict]) -> None:
         span.set_attribute("collection", settings.qdrant.collection_sparse)
 
 
+def _build_filter(team_id: str, ticker: str | None) -> Filter:
+    """Build a Qdrant filter enforcing scope and optional ticker constraints.
+
+    Scope filtering is mandatory on every search — a missing scope filter
+    would allow a tenant to see documents they are not authorized to see.
+    Ticker filtering is optional and used when the query is company-specific.
+
+    Args:
+        team_id: The requesting team. Chunks must have this team_id or
+                 'public' in their scopes list.
+        ticker:  Optional company ticker. When set, restricts results to
+                 chunks from that company only.
+
+    Returns:
+        A Qdrant Filter with all required conditions.
+    """
+    must: list = [
+        FieldCondition(
+            key="scopes",
+            match=MatchAny(any=[team_id, "public"]),
+        )
+    ]
+    if ticker:
+        must.append(
+            FieldCondition(
+                key="ticker",
+                match=MatchValue(value=ticker),
+            )
+        )
+    return Filter(must=must)
+
+
+def _points_to_chunks(points: list) -> list[Chunk]:
+    """Convert Qdrant query result points to Chunk model objects."""
+    chunks = []
+    for result in points:
+        payload = result.payload or {}
+        chunks.append(
+            Chunk(
+                chunk_id=str(result.id),
+                doc_id=payload.get("doc_id", ""),
+                content=payload.get("content", ""),
+                score=result.score,
+                token_count=payload.get("token_count", 0),
+                metadata=ChunkMetadata(
+                    doc_id=payload.get("doc_id", ""),
+                    ticker=payload.get("ticker", ""),
+                    company_name=payload.get("company_name", ""),
+                    filing_type=payload.get("filing_type", "10-K"),
+                    filing_date=payload.get("filing_date", "2024-01-01"),
+                    section=payload.get("section", ""),
+                    chunk_index=payload.get("chunk_index", 0),
+                    token_count=payload.get("token_count", 0),
+                    embedding_model=payload.get("embedding_model", ""),
+                    scopes=payload.get("scopes", ["public"]),
+                ),
+            )
+        )
+    return chunks
+
+
+async def search_dense(
+    query_embedding: list[float],
+    team_id: str,
+    k: int,
+    ticker: str | None = None,
+) -> list[Chunk]:
+    """Search the dense vector collection.
+
+    Scope filtering is mandatory. When ticker is provided, results are
+    further restricted to that company — prevents cross-company
+    contamination in both production queries and eval runs.
+
+    Args:
+        query_embedding: The embedded query vector.
+        team_id: The requesting team. Used to filter by scopes.
+        k: Maximum number of results to return.
+        ticker: Optional company ticker to restrict to one company.
+
+    Returns:
+        List of Chunk objects sorted by descending relevance score.
+    """
+    client = get_client()
+
+    with tracer.start_as_current_span("qdrant.search_dense") as span:
+        span.set_attribute("team_id", team_id)
+        span.set_attribute("k", k)
+        if ticker:
+            span.set_attribute("ticker", ticker)
+
+        results = await client.query_points(
+            collection_name=settings.qdrant.collection_dense,
+            query=query_embedding,
+            query_filter=_build_filter(team_id, ticker),
+            limit=k,
+            with_payload=True,
+        )
+
+        span.set_attribute("results.count", len(results.points))
+        return _points_to_chunks(results.points)
+
+
 async def search_sparse(
     sparse_vector: dict[int, float],
     team_id: str,
     k: int,
+    ticker: str | None = None,
 ) -> list[Chunk]:
     """Search the sparse vector collection.
 
-    Same scope filtering as search_dense — tenant isolation is
-    enforced at the data layer on every search operation.
+    Same scope and ticker filtering as search_dense — tenant isolation
+    is enforced at the data layer on every search operation regardless
+    of retrieval method.
 
     Args:
         sparse_vector: SPLADE sparse vector from encode_sparse().
         team_id: The requesting team. Used to filter by scopes.
         k: Maximum number of results to return.
+        ticker: Optional company ticker to restrict to one company.
 
     Returns:
         List of Chunk objects sorted by descending relevance score.
@@ -308,15 +334,8 @@ async def search_sparse(
         span.set_attribute("team_id", team_id)
         span.set_attribute("k", k)
         span.set_attribute("nonzero_terms", len(sparse_vector))
-
-        scope_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="scopes",
-                    match=MatchAny(any=[team_id, "public"]),
-                )
-            ]
-        )
+        if ticker:
+            span.set_attribute("ticker", ticker)
 
         results = await client.query_points(
             collection_name=settings.qdrant.collection_sparse,
@@ -325,36 +344,10 @@ async def search_sparse(
                 values=list(sparse_vector.values()),
             ),
             using="sparse",
-            query_filter=scope_filter,
+            query_filter=_build_filter(team_id, ticker),
             limit=k,
             with_payload=True,
         )
 
         span.set_attribute("results.count", len(results.points))
-
-        chunks = []
-        for result in results.points:
-            payload = result.payload or {}
-            chunks.append(
-                Chunk(
-                    chunk_id=str(result.id),
-                    doc_id=payload.get("doc_id", ""),
-                    content=payload.get("content", ""),
-                    score=result.score,
-                    token_count=payload.get("token_count", 0),
-                    metadata=ChunkMetadata(
-                        doc_id=payload.get("doc_id", ""),
-                        ticker=payload.get("ticker", ""),
-                        company_name=payload.get("company_name", ""),
-                        filing_type=payload.get("filing_type", "10-K"),
-                        filing_date=payload.get("filing_date", "2024-01-01"),
-                        section=payload.get("section", ""),
-                        chunk_index=payload.get("chunk_index", 0),
-                        token_count=payload.get("token_count", 0),
-                        embedding_model=payload.get("embedding_model", ""),
-                        scopes=payload.get("scopes", ["public"]),
-                    ),
-                )
-            )
-
-        return chunks
+        return _points_to_chunks(results.points)

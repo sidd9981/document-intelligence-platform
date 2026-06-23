@@ -1,137 +1,137 @@
 [
     {
-      "id": "ops-001",
-      "team": "ops",
-      "intent": "factual",
-      "query": "How does Apple describe competition in its filings?",
-      "expected_answer_contains": ["competition", "substantial", "resources"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1"]
-    },
-    {
-      "id": "ops-002",
-      "team": "ops",
-      "intent": "factual",
-      "query": "What risks does Apple face from international operations?",
-      "expected_answer_contains": ["international", "risk", "operations"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1A"]
-    },
-    {
-      "id": "ops-003",
-      "team": "ops",
-      "intent": "factual",
-      "query": "What third party manufacturers does Apple depend on?",
-      "expected_answer_contains": ["manufacturers", "suppliers", "third-party"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1A"]
-    },
-    {
-      "id": "ops-004",
-      "team": "ops",
-      "intent": "factual",
-      "query": "What products does Apple make?",
-      "expected_answer_contains": ["iPhone", "Mac", "iPad"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1"]
-    },
-    {
-      "id": "ops-005",
-      "team": "ops",
-      "intent": "factual",
-      "query": "What are Apple main product categories?",
-      "expected_answer_contains": ["iPhone", "Services", "Mac"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1"]
-    },
-    {
-      "id": "risk-001",
+      "id": "aapl-risk-001",
+      "ticker": "AAPL",
       "team": "risk",
       "intent": "extraction",
       "query": "What regulatory risks does Apple disclose?",
-      "expected_answer_contains": ["regulatory", "laws", "compliance"],
-      "expected_source_filing_types": ["10-K"],
+      "ground_truth": "Apple discloses regulatory risks including compliance with complex and changing laws and regulations worldwide, including privacy, data protection, consumer protection, and competition laws. The company notes that compliance is complex and may impose significant costs.",
       "expected_sections": ["Item 1A"]
     },
     {
-      "id": "risk-002",
+      "id": "aapl-risk-002",
+      "ticker": "AAPL",
       "team": "risk",
       "intent": "extraction",
-      "query": "What are Apple key personnel risks?",
-      "expected_answer_contains": ["key", "personnel", "executives"],
-      "expected_source_filing_types": ["10-K"],
+      "query": "What supply chain concentration risks does Apple disclose?",
+      "ground_truth": "Apple discloses supply chain concentration risks including dependence on sole-source suppliers for certain components such as semiconductors and displays. The company relies heavily on Taiwan Semiconductor Manufacturing Company which manufactures substantially all of Apple's custom silicon chips.",
       "expected_sections": ["Item 1A"]
     },
     {
-      "id": "risk-003",
-      "team": "risk",
-      "intent": "extraction",
-      "query": "What cybersecurity risks does Apple disclose?",
-      "expected_answer_contains": ["security", "data", "breach"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1A"]
-    },
-    {
-      "id": "risk-004",
+      "id": "aapl-risk-003",
+      "ticker": "AAPL",
       "team": "risk",
       "intent": "extraction",
       "query": "What intellectual property risks does Apple face?",
-      "expected_answer_contains": ["intellectual property", "patents", "litigation"],
-      "expected_source_filing_types": ["10-K"],
+      "ground_truth": "Apple faces intellectual property risks including patent claims and litigation from third parties alleging infringement of their patents or other intellectual property rights. The company expects to face and is currently facing patent claims.",
       "expected_sections": ["Item 1A"]
     },
     {
-      "id": "risk-005",
+      "id": "msft-risk-001",
+      "ticker": "MSFT",
       "team": "risk",
       "intent": "extraction",
-      "query": "What macroeconomic risks does Apple disclose in its annual filing?",
-      "expected_answer_contains": ["economic", "consumer", "demand"],
-      "expected_source_filing_types": ["10-K"],
+      "query": "What cybersecurity risks does Microsoft disclose?",
+      "ground_truth": "Microsoft discloses cybersecurity risks including threats to its cloud infrastructure, software products, and internal systems. Cyberattacks could result in unauthorized access to customer data, disruption of services, and reputational damage.",
       "expected_sections": ["Item 1A"]
     },
     {
-      "id": "analysis-001",
+      "id": "msft-risk-002",
+      "ticker": "MSFT",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What competition risks does Microsoft disclose in its annual filing?",
+      "ground_truth": "Microsoft discloses competition risks across its business segments including cloud services, productivity software, and gaming. The company competes with Amazon, Google, Apple, and others who have significant resources.",
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "tsla-risk-001",
+      "ticker": "TSLA",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What manufacturing risks does Tesla disclose?",
+      "ground_truth": "Tesla discloses manufacturing risks including challenges scaling production, dependence on key suppliers for battery cells and components, and risks from manufacturing concentration at specific facilities.",
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "tsla-risk-002",
+      "ticker": "TSLA",
+      "team": "risk",
+      "intent": "extraction",
+      "query": "What regulatory risks does Tesla face related to autonomous driving?",
+      "ground_truth": "Tesla faces regulatory risks related to its autonomous driving technology including evolving regulations around self-driving vehicles, potential liability from accidents involving autopilot features, and uncertainty around regulatory approval timelines.",
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "aapl-analytical-001",
+      "ticker": "AAPL",
       "team": "analysis",
       "intent": "analytical",
-      "query": "How does Apple describe its competitive position in the smartphone market?",
-      "expected_answer_contains": ["competition", "iPhone", "market"],
-      "expected_source_filing_types": ["10-K"],
+      "query": "How does Apple describe its dependence on TSMC across its 10-K filings?",
+      "ground_truth": "Apple describes its dependence on Taiwan Semiconductor Manufacturing Company as a sole-source supplier for custom silicon chips. The company acknowledges this concentration risk and that any disruption to TSMC's operations could materially affect Apple's ability to produce its products.",
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "aapl-analytical-002",
+      "ticker": "AAPL",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "How does Apple describe risks from its international operations including China exposure?",
+      "ground_truth": "Apple discloses that its manufacturing is concentrated in China and a significant portion of revenue is generated internationally. The company faces risks from changes in trade policies, tariffs, export controls, and geopolitical tensions that could adversely affect its business.",
+      "expected_sections": ["Item 1A"]
+    },
+    {
+      "id": "msft-analytical-001",
+      "ticker": "MSFT",
+      "team": "analysis",
+      "intent": "analytical",
+      "query": "How does Microsoft describe its cloud computing business and competitive position?",
+      "ground_truth": "Microsoft describes its cloud business through Azure and other services as a key growth driver. The company competes with Amazon Web Services and Google Cloud and emphasizes its enterprise relationships and hybrid cloud capabilities as competitive advantages.",
       "expected_sections": ["Item 1"]
     },
     {
-      "id": "analysis-002",
+      "id": "tsla-analytical-001",
+      "ticker": "TSLA",
       "team": "analysis",
       "intent": "analytical",
-      "query": "What supply chain concentration risks does Apple disclose?",
-      "expected_answer_contains": ["supplier", "concentration", "sole-source"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1A"]
-    },
-    {
-      "id": "analysis-003",
-      "team": "analysis",
-      "intent": "analytical",
-      "query": "How does Apple describe its services business?",
-      "expected_answer_contains": ["Services", "revenue", "growth"],
-      "expected_source_filing_types": ["10-K"],
+      "query": "How does Tesla describe its energy storage and generation business?",
+      "ground_truth": "Tesla describes its energy generation and storage segment including Powerwall, Powerpack, and Megapack products as a growing part of its business. The company positions this alongside its automotive business as part of its sustainable energy mission.",
       "expected_sections": ["Item 1"]
     },
     {
-      "id": "analysis-004",
-      "team": "analysis",
-      "intent": "analytical",
-      "query": "What risks does Apple face in China?",
-      "expected_answer_contains": ["China", "international", "operations"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1A"]
+      "id": "aapl-adversarial-001",
+      "ticker": "AAPL",
+      "team": "ops",
+      "intent": "adversarial",
+      "query": "What was Apple's exact revenue in Q3 2019?",
+      "ground_truth": "The corpus contains 10-K annual filings from 2022 onwards and does not contain 2019 quarterly data. A correct system should indicate the information is not available in the retrieved context rather than hallucinating a figure.",
+      "expected_sections": []
     },
     {
-      "id": "analysis-005",
-      "team": "analysis",
-      "intent": "analytical",
-      "query": "How does Apple describe risks from dependence on third party software platforms?",
-      "expected_answer_contains": ["platform", "software", "third-party"],
-      "expected_source_filing_types": ["10-K"],
-      "expected_sections": ["Item 1A"]
+      "id": "msft-adversarial-001",
+      "ticker": "MSFT",
+      "team": "ops",
+      "intent": "adversarial",
+      "query": "What did Microsoft say about acquiring TikTok?",
+      "ground_truth": "The corpus contains Microsoft 10-K filings focused on risk factors and business description. TikTok acquisition discussions may not be explicitly covered. A correct system should answer only from retrieved context and not hallucinate details.",
+      "expected_sections": []
+    },
+    {
+      "id": "aapl-ops-001",
+      "ticker": "AAPL",
+      "team": "ops",
+      "intent": "factual",
+      "query": "What products does Apple make according to its annual filing?",
+      "ground_truth": "According to its 10-K filings Apple makes iPhone, Mac, iPad, Apple Watch, AirPods, Apple TV and related accessories. The company also operates a growing Services segment including the App Store, Apple Music, iCloud, and Apple Pay.",
+      "expected_sections": ["Item 1"]
+    },
+    {
+      "id": "tsla-ops-001",
+      "ticker": "TSLA",
+      "team": "ops",
+      "intent": "factual",
+      "query": "What vehicles does Tesla produce according to its annual filing?",
+      "ground_truth": "Tesla produces the Model S, Model 3, Model X, Model Y, Cybertruck, and Semi according to its 10-K filings. The company also manufactures energy storage products including Powerwall and Megapack.",
+      "expected_sections": ["Item 1"]
     }
   ]
