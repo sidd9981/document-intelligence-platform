@@ -7,26 +7,31 @@ audit logging. Every request flows through this state machine.
 
 The state object is the single source of truth. Nodes read from it and
 write back to it. Agents never communicate directly with each other.
+
+The raw current query drives intent classification, entity extraction,
+retrieval, caching, audit, and the faithfulness judge. When a request
+carries prior conversation turns, the gateway has already validated and
+injection-scanned them and hands us a separate conversation_context. That
+context is used only by the synthesis agent, so prior turns can never
+pollute the ticker filter, the embedding, or the faithfulness score.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import re
 import uuid
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from finsight.services.metrics import faithfulness_score, tokens_used_total
-import asyncio
-from finsight.harness.eval_harness import maybe_run_eval
 
 from finsight.agents.graph_agent import GraphAgent
 from finsight.agents.retrieval_agent import RetrievalAgent
 from finsight.agents.synthesis_agent import SynthesisAgent
+from finsight.harness.eval_harness import maybe_run_eval
 from finsight.harness.input_harness import run_input_harness
 from finsight.harness.output_harness import run_output_harness
-from finsight.models.base import AgentError, Chunk
+from finsight.models.base import AgentError
 from finsight.models.graph import GraphResult
 from finsight.models.retrieval import RetrievalResult
 from finsight.models.synthesis import QueryResponse, SynthesisResult
@@ -47,6 +52,7 @@ class AgentState(TypedDict):
 
     intent: str
     entities: list[str]
+    conversation_context: str | None
 
     retrieval_result: RetrievalResult | None
     graph_result: GraphResult | None
@@ -66,6 +72,7 @@ def _initial_state(
     query: str,
     tenant_config: TenantConfig,
     trace_id: str,
+    conversation_context: str | None = None,
 ) -> AgentState:
     return AgentState(
         query=query,
@@ -74,6 +81,7 @@ def _initial_state(
         trace_id=trace_id,
         intent="factual",
         entities=[],
+        conversation_context=conversation_context,
         retrieval_result=None,
         graph_result=None,
         synthesis_result=None,
@@ -145,15 +153,26 @@ class Orchestrator:
 
         return builder.compile()
 
-    async def run(self, query: str, tenant_config: TenantConfig) -> QueryResponse:
+    async def run(
+        self,
+        query: str,
+        tenant_config: TenantConfig,
+        conversation_context: str | None = None,
+    ) -> QueryResponse:
         """Run the full request lifecycle and return a response.
 
         Args:
-            query: The raw user query.
+            query: The raw current question. Drives intent classification,
+                   entity extraction, retrieval, the cache key, audit
+                   logging, and the faithfulness judge.
             tenant_config: Controls model tier, context window, and scopes.
+            conversation_context: The history-wrapped prompt the gateway
+                   has already validated and injection-scanned, or None for
+                   a single-turn request. Consumed only by the synthesis
+                   agent so prior turns never affect retrieval or scoring.
 
         Returns:
-            QueryResponse ready to stream to the client.
+            QueryResponse ready to return to the client.
         """
         trace_id = str(uuid.uuid4())
 
@@ -161,7 +180,7 @@ class Orchestrator:
             span.set_attribute("team_id", tenant_config.team_id)
             span.set_attribute("trace_id", trace_id)
 
-            state = _initial_state(query, tenant_config, trace_id)
+            state = _initial_state(query, tenant_config, trace_id, conversation_context)
             final_state = await self._graph.ainvoke(state)
 
             synthesis = final_state.get("synthesis_result")
@@ -175,14 +194,12 @@ class Orchestrator:
                 )
 
             if synthesis and retrieval:
-                asyncio.create_task(
-                    maybe_run_eval(
-                        query=query,
-                        result=synthesis,
-                        chunks=retrieval.chunks,
-                        trace_id=trace_id,
-                        team_id=tenant_config.team_id,
-                    )
+                await maybe_run_eval(
+                    query=query,
+                    result=synthesis,
+                    chunks=retrieval.chunks,
+                    trace_id=trace_id,
+                    team_id=tenant_config.team_id,
                 )
 
             if final_state["final_response"]:
@@ -213,8 +230,12 @@ class Orchestrator:
         return {"intent": intent}
 
     async def _extract_entities(self, state: AgentState) -> dict:
-        """Extract ticker symbols and company names from the query."""
-        import re
+        """Extract ticker symbols and company names from the raw query.
+
+        Runs against the current question only. History never reaches this
+        node, so a ticker mentioned three turns ago cannot leak into the
+        current turn's retrieval filter.
+        """
         query = state["query"]
         tickers = re.findall(r"\$([A-Z]{1,5})\b|(?<!\w)([A-Z]{2,5})(?=\s)", query)
         entities = list({t[0] or t[1] for t in tickers if any(t)})
@@ -226,7 +247,11 @@ class Orchestrator:
             tenant_config=state["tenant_config"],
             trace_id=state["trace_id"],
         )
-        print(f"RETRIEVAL: chunks={len(result.chunks)} errors={result.errors}")
+        logger.debug(
+            "retrieval complete chunks=%d errors=%d",
+            len(result.chunks),
+            len(result.errors),
+        )
         return {"retrieval_result": result, "cache_hit": result.cache_hit}
 
     async def _invoke_graph_agent(self, state: AgentState) -> dict:
@@ -267,21 +292,22 @@ class Orchestrator:
             total_tokens=harness_result.tokens_in_context,
             latency_ms=retrieval.latency_ms,
         )
-        warning = None
-        if harness_result.low_confidence:
-            warning = "Low confidence retrieval — answer may be incomplete."
-        if harness_result.injection_detected:
-            warning = "Potential prompt injection detected in retrieved content."
-
         return {
             "retrieval_result": updated_retrieval,
             "prompt_version": harness_result.prompt_version,
         }
 
     async def _invoke_synthesis_agent(self, state: AgentState) -> dict:
+        """Synthesize the answer.
+
+        Uses conversation_context when present so the model sees prior turns,
+        otherwise the raw query. This is the only node that reads the
+        history-wrapped prompt.
+        """
         retrieval = state["retrieval_result"]
+        synthesis_query = state["conversation_context"] or state["query"]
         result = await self._synthesis_agent.synthesize(
-            query=state["query"],
+            query=synthesis_query,
             chunks=retrieval.chunks if retrieval else [],
             graph_result=state["graph_result"],
             tenant_config=state["tenant_config"],
@@ -299,6 +325,12 @@ class Orchestrator:
         return "run_output_harness"
 
     async def _run_output_harness(self, state: AgentState) -> dict:
+        """Validate and score the answer against the raw question.
+
+        Faithfulness is judged against state["query"], never the wrapped
+        context, so the score reflects whether the answer is grounded in the
+        retrieved chunks for the actual question asked.
+        """
         synthesis = state["synthesis_result"]
         retrieval = state["retrieval_result"]
 
@@ -325,16 +357,12 @@ class Orchestrator:
         synthesis = state["synthesis_result"]
         warning = None
 
-        if synthesis:
-            faithfulness_score.labels(team_id=state["team_id"]).set(synthesis.faithfulness_score)
-            if synthesis.tokens_used > 0:
-                tokens_used_total.labels(
-                    team_id=state["team_id"],
-                    model=synthesis.model_used,
-                ).inc(synthesis.tokens_used)
-
-            if synthesis.faithfulness_score < 0.85:
-                warning = f"Low confidence answer. Unsupported claims: {', '.join(synthesis.unsupported_claims[:3])}"
+        if synthesis and synthesis.faithfulness_score < 0.85:
+            claims = [c for c in synthesis.unsupported_claims if c.strip()]
+            if claims:
+                warning = f"Low confidence answer. Unsupported claims: {', '.join(claims[:3])}"
+            else:
+                warning = "Low confidence answer — please verify with source documents."
 
         response = QueryResponse(
             trace_id=state["trace_id"],

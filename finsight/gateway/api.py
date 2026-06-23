@@ -1,63 +1,75 @@
 """
 FastAPI gateway.
 
-Phase 5 upgrade: JWT validation, orchestrator wiring, token budget
-enforcement. The Phase 1 direct dense search is replaced by the full
-LangGraph orchestrator pipeline.
+JWT validation, orchestrator wiring, token budget enforcement, and
+streaming. team_id is extracted from the JWT claims rather than passed in
+the request body, so clients cannot declare their own identity.
 
-team_id is now extracted from the JWT claims rather than passed in
-the request body. Clients no longer declare their own identity.
+Conversation history supplied by the client is untrusted. It is length
+bounded, injection scanned, and assembled into a synthesis-only context.
+The raw current query is what gets guardrailed, retrieved on, and audited.
 """
 
 from __future__ import annotations
-from finsight.services.sparse_encoder import init_encoder, close_encoder
-from finsight.services.reranker import init_reranker, close_reranker
-from fastapi.responses import StreamingResponse
-from neo4j import AsyncGraphDatabase
-import redis.asyncio as aioredis
-from finsight.services.circuit_breaker import CircuitBreaker
-from finsight.services.guardrails import check_query
 
+import time
+import time as _time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import AsyncGenerator
-import time as _time
 
-import structlog
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
-from fastapi import Form
-from fastapi.responses import JSONResponse
-import time
 import jwt
-from finsight.auth.scope_definitions import DEV_CLIENTS, TEAM_SCOPES
-from finsight.auth.token_validator import JWT_SECRET, JWT_ALGORITHM
+import redis.asyncio as aioredis
+import structlog
+from fastapi import Depends, FastAPI, Form, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from neo4j import AsyncGraphDatabase
+from prometheus_client import make_asgi_app
+from pydantic import BaseModel, Field
 
 from finsight.agents.graph_agent import GraphAgent
 from finsight.agents.orchestrator import Orchestrator
 from finsight.agents.retrieval_agent import RetrievalAgent
 from finsight.agents.synthesis_agent import SynthesisAgent
-from finsight.auth.token_validator import decode_token, get_team_id
+from finsight.auth.scope_definitions import DEV_CLIENTS, TEAM_SCOPES
+from finsight.auth.token_validator import (
+    JWT_ALGORITHM,
+    JWT_SECRET,
+    decode_token,
+    get_team_id,
+)
 from finsight.config.settings import settings
 from finsight.gateway.db import close_pool, get_pool, init_pool
+from finsight.harness.input_harness import INJECTION_PATTERNS
 from finsight.models.synthesis import QueryResponse
 from finsight.models.tenant import TenantConfig
+from finsight.services.circuit_breaker import CircuitBreaker
+from finsight.services.guardrails import check_query
 from finsight.services.llm import close_client, init_client
+from finsight.services.metrics import (
+    cache_hits_total,
+    cache_misses_total,
+    query_latency,
+)
+from finsight.services.reranker import close_reranker, init_reranker
+from finsight.services.sparse_encoder import close_encoder, init_encoder
 from finsight.services.vector_store import (
     close_client as close_qdrant,
     ensure_collections_exist,
     init_client as init_qdrant,
 )
 from finsight.telemetry.tracing import get_tracer, setup_tracing
-from prometheus_client import make_asgi_app
-from finsight.services.metrics import (
-    query_latency, cache_hits_total, cache_misses_total
-)
 
 log = structlog.get_logger()
 tracer = get_tracer(__name__)
 security = HTTPBearer()
+
+MAX_QUERY_CHARS = 4000
+MAX_TURN_CHARS = 4000
+MAX_HISTORY_TURNS = 3
+MAX_HISTORY_ITEMS = 20
 
 app = FastAPI(
     title="FinSight",
@@ -81,7 +93,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_client()
     init_encoder()
     init_reranker()
-
 
     redis_client = aioredis.from_url(
         f"redis://localhost:6379/{settings.redis.cache_db}",
@@ -121,11 +132,56 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 app.router.lifespan_context = lifespan
 
 
-app.router.lifespan_context = lifespan
+class ConversationTurn(BaseModel):
+    """A single prior exchange supplied by the client for context.
+
+    Both fields are client controlled and therefore untrusted. The length
+    caps bound prompt size so a client cannot inflate token cost or push the
+    synthesis prompt past a tenant's context window.
+    """
+
+    query: str = Field(max_length=MAX_TURN_CHARS)
+    answer: str = Field(max_length=MAX_TURN_CHARS)
 
 
 class QueryRequest(BaseModel):
-    query: str
+    query: str = Field(max_length=MAX_QUERY_CHARS)
+    history: list[ConversationTurn] = Field(default_factory=list, max_length=MAX_HISTORY_ITEMS)
+
+
+def _build_conversation_context(query: str, history: list[ConversationTurn]) -> str:
+    """Assemble the synthesis context from validated conversation history.
+
+    History is client supplied and untrusted. The current query is guardrailed
+    separately by the caller; this function applies the same injection scan the
+    input harness runs on retrieved chunks to every historical turn before any
+    of it can reach the LLM. We fail closed: a single injection hit rejects the
+    whole request.
+
+    Only the most recent MAX_HISTORY_TURNS turns are included. Returns the bare
+    query when there is no history so a single-turn request pays no wrapping cost.
+    """
+    if not history:
+        return query
+
+    recent = history[-MAX_HISTORY_TURNS:]
+
+    for turn in recent:
+        for text in (turn.query, turn.answer):
+            for pattern in INJECTION_PATTERNS:
+                if pattern.search(text):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "message": "conversation history contains disallowed content",
+                            "violation_type": "history_injection",
+                        },
+                    )
+
+    history_text = "\n".join(
+        f"User: {turn.query}\nAssistant: {turn.answer}" for turn in recent
+    )
+    return f"Previous conversation:\n{history_text}\n\nCurrent question: {query}"
 
 
 async def _get_tenant_config(team_id: str) -> TenantConfig:
@@ -152,11 +208,36 @@ async def _get_tenant_config(team_id: str) -> TenantConfig:
     )
 
 
+async def _meter_budget(team_id: str) -> None:
+    """Increment the team's daily token counter in Redis.
+
+    Best effort. A metering failure must never fail the user's request, so
+    every exception is logged and swallowed. The counter expires at the end
+    of its day so budgets reset automatically.
+    """
+    try:
+        r_budget = aioredis.from_url(
+            f"redis://localhost:6379/{settings.redis.budget_db}",
+            decode_responses=True,
+        )
+        key = f"budget:{team_id}:{date.today().isoformat()}"
+        await r_budget.incrby(key, 1000)
+        await r_budget.expire(key, 86400)
+        await r_budget.aclose()
+    except Exception as e:
+        log.warning("budget metering failed", error=str(e))
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(
     request: QueryRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> QueryResponse:
+    """Answer a question, optionally with prior conversation context.
+
+    The raw query is guardrailed and drives retrieval and audit. History is
+    validated, injection scanned, and assembled into a synthesis-only context.
+    """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
 
@@ -174,8 +255,11 @@ async def query(
     team_id = get_team_id(payload)
     tenant_config = await _get_tenant_config(team_id)
 
+    conversation_context = _build_conversation_context(request.query, request.history)
+
     start = _time.perf_counter()
     status = "success"
+    result: QueryResponse | None = None
 
     with tracer.start_as_current_span("gateway.query") as span:
         span.set_attribute("team_id", team_id)
@@ -188,19 +272,18 @@ async def query(
             result = await _orchestrator.run(
                 query=request.query,
                 tenant_config=tenant_config,
+                conversation_context=conversation_context,
             )
+            await _meter_budget(team_id)
         except Exception:
             status = "error"
             raise
         finally:
             latency = _time.perf_counter() - start
             query_latency.labels(team_id=team_id, intent="unknown", status=status).observe(latency)
-            try:
-                if result and result.cache_hit:
-                    cache_hits_total.labels(team_id=team_id).inc()
-                else:
-                    cache_misses_total.labels(team_id=team_id).inc()
-            except UnboundLocalError:
+            if result and result.cache_hit:
+                cache_hits_total.labels(team_id=team_id).inc()
+            else:
                 cache_misses_total.labels(team_id=team_id).inc()
 
         await _log_query(
@@ -213,22 +296,27 @@ async def query(
         )
 
         return result
-    
+
+
 @app.post("/query/stream")
 async def query_stream(
     request: QueryRequest,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> StreamingResponse:
-    """Stream the answer token by token as server-sent events.
+    """Stream a grounded answer as server-sent events.
 
-    The client receives a text/event-stream response. Each token
-    arrives as 'data: <token>\n\n'. The stream ends with
-    'data: [DONE]\n\n'. This is standard SSE format — works in
-    any browser EventSource or curl with no special client library.
+    This routes through the full orchestrator exactly like /query, so the
+    answer is retrieved, harnessed, and faithfulness scored. The completed
+    answer is then streamed back word by word as SSE so the client gets a
+    progressive render. Each chunk arrives as 'data: <word> \\n\\n' and the
+    stream ends with 'data: [DONE]\\n\\n'.
+
+    Streaming raw LLM tokens directly would bypass retrieval and the harnesses,
+    producing ungrounded output, so we do not do that here.
     """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="query must not be empty")
-    
+
     guardrail = check_query(request.query)
     if not guardrail.allowed:
         raise HTTPException(
@@ -243,26 +331,51 @@ async def query_stream(
     team_id = get_team_id(payload)
     tenant_config = await _get_tenant_config(team_id)
 
-    async def event_stream():
-        from finsight.services.llm import stream_complete
+    conversation_context = _build_conversation_context(request.query, request.history)
 
-        system = "You are a financial analyst. Answer using only the provided context. Be concise and cite sources."
+    if _orchestrator is None:
+        raise HTTPException(status_code=503, detail="orchestrator not initialized")
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        start = _time.perf_counter()
+        status = "success"
+        result: QueryResponse | None = None
 
         with tracer.start_as_current_span("gateway.query_stream") as span:
             span.set_attribute("team_id", team_id)
             span.set_attribute("query_length", len(request.query))
 
             try:
-                async for token in stream_complete(
-                    prompt=request.query,
-                    system=system,
-                    max_tokens=tenant_config.max_output_tokens,
-                ):
-                    yield f"data: {token}\n\n"
+                result = await _orchestrator.run(
+                    query=request.query,
+                    tenant_config=tenant_config,
+                    conversation_context=conversation_context,
+                )
+                for word in result.answer.split(" "):
+                    yield f"data: {word} \n\n"
+                await _meter_budget(team_id)
             except Exception as e:
+                status = "error"
                 log.error("stream error", error=str(e))
-                yield f"data: [ERROR]\n\n"
+                yield "data: [ERROR]\n\n"
             finally:
+                latency = _time.perf_counter() - start
+                query_latency.labels(
+                    team_id=team_id, intent="unknown", status=status
+                ).observe(latency)
+                if result and result.cache_hit:
+                    cache_hits_total.labels(team_id=team_id).inc()
+                else:
+                    cache_misses_total.labels(team_id=team_id).inc()
+                if result:
+                    await _log_query(
+                        trace_id=result.trace_id,
+                        team_id=team_id,
+                        query_text=request.query,
+                        chunks_retrieved=len(result.citations),
+                        model_used=result.model_used,
+                        total_tokens=0,
+                    )
                 yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -304,6 +417,7 @@ async def _log_query(
     except Exception as exc:
         log.error("failed to write audit log", error=str(exc))
 
+
 @app.post("/oauth/token")
 async def issue_token(
     grant_type: str = Form(...),
@@ -334,3 +448,30 @@ async def issue_token(
         "expires_in": 3600,
         "scope": " ".join(scopes),
     })
+
+
+@app.get("/budget/{team_id}")
+async def get_budget(
+    team_id: str,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    payload = decode_token(credentials.credentials)
+    if get_team_id(payload) != team_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    tenant_config = await _get_tenant_config(team_id)
+
+    r = aioredis.from_url(
+        f"redis://localhost:6379/{settings.redis.budget_db}",
+        decode_responses=True,
+    )
+    key = f"budget:{team_id}:{date.today().isoformat()}"
+    used = int(await r.get(key) or 0)
+    await r.aclose()
+
+    return {
+        "team_id": team_id,
+        "used": used,
+        "limit": tenant_config.daily_token_budget,
+        "pct": round(used / tenant_config.daily_token_budget * 100, 1),
+    }
