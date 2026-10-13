@@ -1,27 +1,26 @@
 """
 Eval harness.
 
-Async evaluation on sampled live traffic. Computes lightweight
-metrics and logs full traces to Langfuse. Does not block the user
-response — called with asyncio.create_task() after the response
-is sent.
+Online evaluation on sampled live traffic. Computes lightweight metrics
+and logs full traces to Langfuse. Samples EVAL_SAMPLE_RATE of requests
+to limit Langfuse volume.
 
-Metrics logged per trace:
-    faithfulness: from the output harness LLM-as-judge score
-    answer_relevance: keyword overlap between query and answer
-    context_recall: fraction of retrieved chunks with score > 0.5
+Metrics logged per sampled trace:
+    faithfulness: the output harness LLM-judge score
+    answer_relevance: share of non-stopword query terms found in the answer,
+        a cheap lexical proxy, not the ragas metric
+    context_recall: share of retrieved chunks with score above 0.5, a
+        proxy only. Scores are cross-encoder logits, so this threshold is
+        not calibrated and the name overstates what it measures
     prompt_version: stamped on every trace for regression detection
 
-Full RAGAS metrics (context precision, answer correctness) are
-documented as a Phase 6.5 upgrade once baseline Langfuse logging
-is confirmed working.
+The offline eval in eval/offline_eval.py computes the real ragas metrics.
 """
 
 from __future__ import annotations
 
 import logging
 import random
-from typing import TYPE_CHECKING
 
 from langfuse import Langfuse
 
@@ -30,13 +29,10 @@ from finsight.models.base import Chunk
 from finsight.models.synthesis import SynthesisResult
 from finsight.telemetry.tracing import get_tracer
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
 
-EVAL_SAMPLE_RATE = 1.0
+EVAL_SAMPLE_RATE = 0.1
 
 _langfuse: Langfuse | None = None
 
@@ -54,14 +50,10 @@ def get_langfuse() -> Langfuse:
 
 
 def _score_answer_relevance(query: str, answer: str) -> float:
-    """Lightweight proxy for answer relevance.
+    """Lexical proxy for answer relevance.
 
-    Checks what fraction of meaningful query terms appear in the
-    answer. Not as accurate as an LLM judge but zero additional
-    latency and zero additional cost.
-
-    Full RAGAS answer relevance (embedding-based) is a Phase 6.5
-    upgrade.
+    Returns the fraction of non-stopword query terms that appear in the
+    answer. Zero added latency and cost, but much weaker than an LLM judge.
     """
     if not query or not answer:
         return 0.0
@@ -78,10 +70,10 @@ def _score_answer_relevance(query: str, answer: str) -> float:
 
 
 def _score_context_recall(chunks: list[Chunk]) -> float:
-    """Fraction of retrieved chunks with retrieval score above 0.5.
+    """Fraction of retrieved chunks with a score above 0.5.
 
-    A proxy for whether the retrieval pipeline is returning relevant
-    context. If most chunks are below 0.5 the retrieval is struggling.
+    A rough proxy for retrieval health, not true recall, which needs
+    ground-truth relevant chunks.
     """
     if not chunks:
         return 0.0
@@ -96,17 +88,16 @@ async def maybe_run_eval(
     trace_id: str,
     team_id: str,
 ) -> None:
-    """Evaluate a query-result pair and log to Langfuse if sampled.
+    """Evaluate a query-result pair and log to Langfuse if this request is sampled.
 
-    Called after the response is sent so it never blocks the user.
-    Samples at EVAL_SAMPLE_RATE (10%) to limit Langfuse usage.
+    Samples EVAL_SAMPLE_RATE of requests. Logging failures are caught and
+    logged so they never affect the user's response.
 
     Args:
         query: The original user query.
         result: The synthesis result from the output harness.
         chunks: The retrieved chunks that were passed to the LLM.
-        trace_id: The OTEL trace ID, used as Langfuse trace ID so
-                  traces are correlatable across both systems.
+        trace_id: Used as the Langfuse trace id so traces correlate with OTEL.
         team_id: Used as a tag for filtering in Langfuse.
     """
     if random.random() > EVAL_SAMPLE_RATE:

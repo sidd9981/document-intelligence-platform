@@ -5,32 +5,51 @@ All calls to Ollama go through this module. Direct use of the OpenAI
 client outside this file is not permitted.
 
 Ollama exposes an OpenAI-compatible API. We use the official OpenAI
-Python client pointed at the Ollama base URL. This means swapping
-to vLLM or the Anthropic API in production requires changing only
-the base URL and model name in settings — no application code changes.
+Python client pointed at the Ollama base URL, so swapping to vLLM or
+another OpenAI-compatible server means changing the base URL and model
+names in settings, not application code.
+
+Tenants are configured with model tiers rather than model names.
+MODEL_TIERS maps each tier to the Ollama model that serves it, and
+resolve_model applies that mapping.
 
 Responsibilities:
     - Token counting before every completion call so the caller knows
       the cost before committing to the request.
-    - OTEL spans on every operation with token counts and latency
-      as span attributes.
-    - Consistent error handling so raw OpenAI client exceptions do
-      not propagate into agent code.
+    - OTEL spans on every operation with model, token counts and latency.
+
+OpenAI client exceptions propagate to the caller. Agents catch them and
+return structured errors.
 """
 
 import time
+from collections.abc import AsyncGenerator
 
 import tiktoken
 from openai import AsyncOpenAI
 
 from finsight.config.settings import settings
 from finsight.telemetry.tracing import get_tracer
-from collections.abc import AsyncGenerator
 
 tracer = get_tracer(__name__)
 
+MODEL_TIERS = {
+    "small": settings.ollama.model,
+    "medium": "llama3.1:8b",
+}
+
 _client: AsyncOpenAI | None = None
 _tokenizer: tiktoken.Encoding | None = None
+
+
+def resolve_model(tier_or_name: str) -> str:
+    """Map a tenant model tier to an Ollama model name.
+
+    Tier names come from tenant_configs.allowed_models. A value that is not
+    a known tier is treated as a literal Ollama model name, so a tenant can
+    also be pinned to one specific model.
+    """
+    return MODEL_TIERS.get(tier_or_name, tier_or_name)
 
 
 def get_client() -> AsyncOpenAI:
@@ -50,10 +69,9 @@ def get_client() -> AsyncOpenAI:
 def get_tokenizer() -> tiktoken.Encoding:
     """Return the shared tokenizer instance.
 
-    Uses cl100k_base which is the tokenizer for GPT-4 and is
-    compatible with Llama models for approximate token counting.
-    Exact token counts vary slightly by model but cl100k_base
-    gives a close enough estimate for budget enforcement.
+    Uses cl100k_base, the GPT-4 tokenizer. Llama tokenizers differ, so
+    counts are approximate, close enough for budget enforcement but not
+    exact.
 
     Raises:
         RuntimeError: If called before init_client() has been awaited.
@@ -70,7 +88,7 @@ async def init_client() -> None:
     """Initialize the shared LLM client and tokenizer.
 
     Must be called once at application startup. Safe to call multiple
-    times — subsequent calls return immediately if already initialized.
+    times, subsequent calls return immediately if already initialized.
     """
     global _client, _tokenizer
 
@@ -105,11 +123,10 @@ async def close_client() -> None:
 
 
 def count_tokens(text: str) -> int:
-    """Count the number of tokens in a string.
+    """Count the approximate number of tokens in a string.
 
-    Used before LLM calls to estimate cost and enforce context
-    window limits. Called by the input harness to verify the
-    constructed prompt fits within the tenant's max_context_tokens.
+    Used before LLM calls to estimate cost and enforce context window
+    limits.
 
     Args:
         text: The text to tokenize.
@@ -123,17 +140,15 @@ def count_tokens(text: str) -> int:
 async def embed(text: str) -> list[float]:
     """Generate an embedding vector for the given text.
 
-    Used during ingestion to embed document chunks and during
-    retrieval to embed incoming queries. Both use the same model
-    so query vectors and chunk vectors are in the same space.
+    Used during ingestion to embed document chunks and during retrieval
+    to embed incoming queries. Both use the same model so query vectors
+    and chunk vectors are in the same space.
 
     Args:
-        text: The text to embed. Should be a single chunk or query,
-              not a concatenation of multiple texts.
+        text: A single chunk or query, not a concatenation of several.
 
     Returns:
-        A list of floats representing the embedding vector. Length
-        matches settings.ollama.embedding_dim.
+        The embedding vector. Length matches settings.ollama.embedding_dim.
     """
     client = get_client()
 
@@ -158,6 +173,8 @@ async def complete(
     prompt: str,
     system: str,
     max_tokens: int,
+    model: str | None = None,
+    temperature: float = 0.1,
 ) -> tuple[str, int, int]:
     """Generate a completion for the given prompt.
 
@@ -165,17 +182,20 @@ async def complete(
         prompt: The user message content.
         system: The system message that sets context and behavior.
         max_tokens: Maximum tokens to generate in the response.
+        model: Ollama model name or tenant tier, resolved through
+               resolve_model. Defaults to settings.ollama.model.
+        temperature: Sampling temperature. Judges should pass 0.0.
 
     Returns:
         A tuple of (answer, prompt_tokens, completion_tokens).
-        Token counts are used by the caller to meter actual usage
-        against the tenant's daily budget.
     """
     client = get_client()
+    model_name = resolve_model(model) if model else settings.ollama.model
 
     with tracer.start_as_current_span("llm.complete") as span:
-        span.set_attribute("model", settings.ollama.model)
+        span.set_attribute("model", model_name)
         span.set_attribute("max_tokens", max_tokens)
+        span.set_attribute("temperature", temperature)
 
         prompt_token_count = count_tokens(system + prompt)
         span.set_attribute("prompt_tokens_estimate", prompt_token_count)
@@ -183,13 +203,13 @@ async def complete(
         start = time.perf_counter()
 
         response = await client.chat.completions.create(
-            model=settings.ollama.model,
+            model=model_name,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=max_tokens,
-            temperature=0.1,
+            temperature=temperature,
         )
 
         latency_ms = (time.perf_counter() - start) * 1000
@@ -204,34 +224,36 @@ async def complete(
 
         return answer, prompt_tokens, completion_tokens
 
+
 async def stream_complete(
     prompt: str,
     system: str,
     max_tokens: int,
+    model: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream completion tokens as they are generated.
 
-    Yields each token string as it arrives from Ollama. The caller
-    is responsible for assembling the full answer if needed.
-    Prompt token count is estimated since streaming responses don't
-    always return usage stats mid-stream.
+    Yields each token string as it arrives from Ollama. The caller is
+    responsible for assembling the full answer if needed.
 
     Args:
         prompt: The user message content.
         system: The system message.
         max_tokens: Maximum tokens to generate.
+        model: Ollama model name or tenant tier. Defaults to settings.ollama.model.
 
     Yields:
         Token strings as they arrive.
     """
     client = get_client()
+    model_name = resolve_model(model) if model else settings.ollama.model
 
     with tracer.start_as_current_span("llm.stream_complete") as span:
-        span.set_attribute("model", settings.ollama.model)
+        span.set_attribute("model", model_name)
         span.set_attribute("max_tokens", max_tokens)
 
         stream = await client.chat.completions.create(
-            model=settings.ollama.model,
+            model=model_name,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},

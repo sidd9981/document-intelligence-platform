@@ -39,3 +39,6 @@ mlflow.db
 Claude_context.md
 decision_log.md.venv-eval/
 node_modules/
+
+.venv*/
+eval/results/partial_*.json

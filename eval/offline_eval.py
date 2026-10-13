@@ -1,285 +1,405 @@
 """
-Offline eval runner — real RAGAS-equivalent metrics, no library dependency.
+Offline evaluation of the full FinSight pipeline.
 
-Computes all four canonical RAG evaluation metrics against the golden
-dataset using our own LLM judge implementation in eval/ragas_metrics.py.
-Results are logged to Langfuse and written to stdout.
+Runs every golden query through the production orchestrator, then scores
+the final answer against the exact chunks synthesis received with the
+ragas Faithfulness, LLMContextRecall, LLMContextPrecisionWithReference
+and ResponseRelevancy metrics. A separate judge model at temperature 0
+grades the answers so the generator never scores itself. Adversarial
+queries are scored separately as an abstention rate.
 
-Run manually (main venv, services running):
-    python eval/offline_eval.py
+Full run, for numbers you report:
+    python -m eval.offline_eval --runs 3
 
-Run as CI gate:
-    pytest tests/eval/test_ragas_gate.py -v -m eval
+Quick run on a subset, for checking a fix. Marked partial in the report:
+    python -m eval.offline_eval --runs 1 --limit 3
+    python -m eval.offline_eval --runs 1 --ids aapl-risk-001 msft-risk-001
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import functools
 import json
 import logging
+import re
+import statistics
+import time
+from datetime import datetime
 from pathlib import Path
 
 import yaml
-from langfuse import Langfuse
+from neo4j import AsyncGraphDatabase
 
-from finsight.config.settings import settings
-from finsight.gateway.db import close_pool, init_pool
-from finsight.services.llm import close_client, complete, embed, init_client
-from finsight.services.vector_store import (
-    close_client as close_qdrant,
-    init_client as init_qdrant,
-    search_dense,
-)
+from eval.ragas_metrics import RagasScorer
+from finsight.agents.graph_agent import GraphAgent
+from finsight.agents.orchestrator import Orchestrator
+from finsight.agents.retrieval_agent import RetrievalAgent
+from finsight.agents.synthesis_agent import SynthesisAgent
+from finsight.gateway.db import close_pool, get_pool, init_pool
+from finsight.models.tenant import TenantConfig
+from finsight.services.circuit_breaker import CircuitBreaker
+from finsight.services.llm import close_client, complete, init_client
+from finsight.services.reranker import close_reranker, init_reranker
+from finsight.services.sparse_encoder import close_encoder, init_encoder
+from finsight.services.vector_store import close_client as close_qdrant
+from finsight.services.vector_store import init_client as init_qdrant
 from finsight.telemetry.tracing import setup_tracing
-from eval.ragas_metrics import score_all
 
 logger = logging.getLogger(__name__)
 
 GOLDEN_DATASET_PATH = Path(__file__).parent / "golden_dataset" / "queries.json"
 THRESHOLDS_PATH = Path(__file__).parent / "thresholds.yaml"
+RESULTS_DIR = Path(__file__).parent / "results"
 
-lf = Langfuse(
-    public_key=settings.langfuse.public_key,
-    secret_key=settings.langfuse.secret_key,
-    host=settings.langfuse.host,
+METRICS = ("context_precision", "context_recall", "faithfulness", "answer_relevancy")
+DEFAULT_JUDGE_MODEL = "qwen2.5:7b"
+DEFAULT_THRESHOLDS = {
+    "context_precision": 0.60,
+    "context_recall": 0.60,
+    "faithfulness": 0.75,
+    "answer_relevancy": 0.60,
+}
+TENANT_FIELDS = (
+    "team_id",
+    "daily_token_budget",
+    "max_context_tokens",
+    "max_output_tokens",
+    "requests_per_minute",
+    "priority",
+    "allowed_models",
+    "retrieval_k",
+    "data_scopes",
 )
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_AUTH = ("neo4j", "changeme")
+
+_ABSTENTION_PROMPT = """The question below asks for information that is not in the system's documents.
+
+Question: {question}
+
+Answer: {answer}
+
+Did the answer decline or state that the information is not available, without inventing specific facts, figures, or events?
+
+Respond with exactly one line in this format:
+ABSTAINED: <yes or no>"""
+
+_ABSTAINED_LINE = re.compile(r"ABSTAINED:\s*(yes|no)\b", re.IGNORECASE)
+
+
+class _NoCache:
+    """Stand-in Redis client that never hits, so every run retrieves fresh."""
+
+    async def get(self, key: str) -> None:
+        return None
+
+    async def set(self, key: str, value: bytes, ex: int | None = None) -> None:
+        return None
 
 
 def load_thresholds() -> dict:
+    """Load gate thresholds from thresholds.yaml, falling back to defaults."""
     if THRESHOLDS_PATH.exists():
         with open(THRESHOLDS_PATH) as f:
             return yaml.safe_load(f)
-    return {
-        "context_precision": 0.60,
-        "context_recall": 0.60,
-        "faithfulness": 0.75,
-        "answer_relevancy": 0.60,
-    }
+    return dict(DEFAULT_THRESHOLDS)
 
 
 def load_golden_dataset() -> list[dict]:
+    """Load the golden query set."""
     with open(GOLDEN_DATASET_PATH) as f:
         return json.load(f)
 
 
-def _log_to_langfuse(
-    item_id: str,
-    query: str,
-    answer: str,
-    chunks: list,
-    scores: dict,
-    team_id: str,
-) -> None:
+def select_items(items: list[dict], limit: int | None, ids: list[str] | None) -> list[dict]:
+    """Narrow the golden set to the requested ids, then to the first limit items.
+
+    Raises:
+        ValueError: If a requested id is not in the golden set, or nothing is left.
+    """
+    selected = items
+    if ids:
+        known = {item["id"] for item in items}
+        unknown = [i for i in ids if i not in known]
+        if unknown:
+            raise ValueError(f"unknown golden ids: {unknown}")
+        selected = [item for item in items if item["id"] in ids]
+    if limit is not None:
+        selected = selected[:limit]
+    if not selected:
+        raise ValueError("no golden items selected")
+    return selected
+
+
+async def load_tenant_configs(team_ids: set[str]) -> dict[str, TenantConfig]:
+    """Load each team's TenantConfig from Postgres, failing loudly on a missing team."""
+    configs: dict[str, TenantConfig] = {}
+    async with get_pool().acquire() as conn:
+        for team_id in team_ids:
+            row = await conn.fetchrow(
+                "SELECT * FROM tenant_configs WHERE team_id = $1",
+                team_id,
+            )
+            if row is None:
+                raise RuntimeError(
+                    f"team {team_id} not in tenant_configs, run scripts/seed_tenants.py"
+                )
+            configs[team_id] = TenantConfig(**{name: row[name] for name in TENANT_FIELDS})
+    return configs
+
+
+def build_orchestrator(neo4j_driver) -> Orchestrator:
+    """Wire the orchestrator the same way the gateway lifespan does, minus the cache."""
+    return Orchestrator(
+        retrieval_agent=RetrievalAgent(
+            redis_client=_NoCache(),
+            breaker=CircuitBreaker(name="qdrant", failure_threshold=5, recovery_timeout=30.0),
+        ),
+        graph_agent=GraphAgent(
+            driver=neo4j_driver,
+            breaker=CircuitBreaker(name="neo4j", failure_threshold=5, recovery_timeout=30.0),
+        ),
+        synthesis_agent=SynthesisAgent(),
+    )
+
+
+async def judge_abstention(question: str, answer: str, judge) -> bool | None:
+    """Ask the judge whether the answer declined instead of inventing facts."""
     try:
-        obs = lf.start_observation(
-            name="finsight_query",
-            as_type="evaluator",
-            input=query,
-            output=result.answer,
-            metadata={
-                "team_id": team_id,
-                "prompt_version": result.prompt_version,
-                "model_used": result.model_used,
-                "chunks_retrieved": len(chunks),
-            },
+        response, _, _ = await judge(
+            prompt=_ABSTENTION_PROMPT.format(question=question, answer=answer),
+            system="You are a strict evaluator. Follow the format exactly.",
+            max_tokens=10,
         )
-
-        for metric_name, score in [
-            ("faithfulness", result.faithfulness_score),
-            ("answer_relevance", answer_relevance),
-            ("context_recall", context_recall),
-        ]:
-            if score is not None:
-                obs.score_trace(name=metric_name, value=float(score))
-
-        obs.end()
-        lf.flush()
     except Exception as e:
-        logger.warning("langfuse logging skipped: %s", e)
+        logger.warning("abstention judge call failed: %s", e)
+        return None
+    match = _ABSTAINED_LINE.search(response.replace("*", ""))
+    return match.group(1).lower() == "yes" if match else None
 
 
-async def _run_single_item(item: dict) -> dict:
-    query = item["query"]
-    ground_truth = item["ground_truth"]
-    ticker = item.get("ticker")
-    team_id = item["team"]
-    is_adversarial = "adversarial" in item.get("id", "")
+async def evaluate_item(
+    item: dict,
+    orchestrator: Orchestrator,
+    tenant_config: TenantConfig,
+    judge,
+    scorer: RagasScorer,
+) -> dict:
+    """Run one golden query through the full pipeline and score the result."""
+    start = time.perf_counter()
+    state = await orchestrator.run_state(query=item["query"], tenant_config=tenant_config)
+    latency_ms = (time.perf_counter() - start) * 1000
 
-    embedding = await embed(query)
-    chunks = await search_dense(
-        query_embedding=embedding,
-        team_id=team_id,
-        k=10,
-        ticker=ticker,
+    retrieval = state.get("retrieval_result")
+    synthesis = state.get("synthesis_result")
+    final = state.get("final_response")
+    chunks = retrieval.chunks if retrieval else []
+
+    if synthesis and synthesis.answer:
+        answer = synthesis.answer
+    else:
+        answer = final.answer if final else ""
+
+    expected_ticker = item.get("ticker")
+    ticker_match_rate = (
+        sum(1 for c in chunks if c.metadata.ticker == expected_ticker) / len(chunks)
+        if chunks and expected_ticker
+        else None
     )
 
-    contexts = [c.content for c in chunks]
-
-    if not contexts:
-        logger.warning(
-            "no chunks retrieved for %s (ticker=%s team=%s)",
-            item["id"], ticker, team_id,
-        )
-        return {
-            "id": item["id"],
-            "team": team_id,
-            "intent": item.get("intent", ""),
-            "question": query,
-            "answer": "No relevant context found.",
-            "contexts": [],
-            "ground_truth": ground_truth,
-            "chunks": [],
-            "top_score": 0.0,
-            "context_precision": None,
-            "context_recall": None,
-            "faithfulness": None,
-            "answer_relevancy": None,
-            "unsupported_claims": [],
-            "chunks_retrieved": 0,
-            "is_adversarial": is_adversarial,
-        }
-
-    context_text = "\n\n---\n\n".join(contexts[:5])
-    answer, _, _ = await complete(
-        prompt=(
-            "Using only the following context, answer the question. "
-            "Be specific and cite relevant details.\n\n"
-            f"Context:\n{context_text}\n\n"
-            f"Question: {query}\n\nAnswer:"
-        ),
-        system=(
-            "You are a financial analyst answering questions about SEC filings. "
-            "Answer using only the provided context."
-        ),
-        max_tokens=400,
-    )
-
-    logger.info(
-        "generated answer for %s: chunks=%d top_score=%.3f",
-        item["id"],
-        len(chunks),
-        chunks[0].score if chunks else 0.0,
-    )
-
-    scores = await score_all(
-        question=query,
-        answer=answer,
-        contexts=contexts,
-        ground_truth=ground_truth,
-        complete_fn=complete,
-    )
-
-    logger.info(
-        "scored %s  cp=%s cr=%s f=%s ar=%s",
-        item["id"],
-        f"{scores['context_precision']:.2f}" if scores["context_precision"] is not None else "None",
-        f"{scores['context_recall']:.2f}" if scores["context_recall"] is not None else "None",
-        f"{scores['faithfulness']:.2f}" if scores["faithfulness"] is not None else "None",
-        f"{scores['answer_relevancy']:.2f}" if scores["answer_relevancy"] is not None else "None",
-    )
-
-    _log_to_langfuse(
-        item_id=item["id"],
-        query=query,
-        answer=answer,
-        chunks=chunks,
-        scores=scores,
-        team_id=team_id,
-    )
-
-    return {
+    record = {
         "id": item["id"],
-        "team": team_id,
+        "team": item["team"],
         "intent": item.get("intent", ""),
-        "question": query,
+        "question": item["query"],
         "answer": answer,
-        "contexts": contexts,
-        "ground_truth": ground_truth,
-        "chunks": chunks,
-        "top_score": chunks[0].score if chunks else 0.0,
-        "chunks_retrieved": len(chunks),
-        "is_adversarial": is_adversarial,
-        **scores,
+        "chunk_ids": [c.chunk_id for c in chunks],
+        "chunk_tickers": [c.metadata.ticker for c in chunks],
+        "chunks_used": len(chunks),
+        "ticker_match_rate": ticker_match_rate,
+        "harness_faithfulness": synthesis.faithfulness_score if synthesis else None,
+        "errors": [e.message for e in state.get("errors", [])],
+        "latency_ms": round(latency_ms, 1),
+        "is_adversarial": item.get("intent") == "adversarial",
     }
 
+    if record["is_adversarial"]:
+        record["abstained"] = await judge_abstention(item["query"], answer, judge)
+        return record
 
-async def run_eval() -> dict:
+    ranked = sorted(chunks, key=lambda c: c.score, reverse=True)
+    scores = await scorer.score(
+        question=item["query"],
+        answer=answer,
+        contexts=[c.content for c in ranked],
+        ground_truth=item["ground_truth"],
+    )
+    record.update(scores)
+    return record
+
+
+def summarize_run(records: list[dict]) -> dict:
+    """Average each metric over the non-adversarial items the judge actually scored."""
+    scored = [r for r in records if not r["is_adversarial"]]
+    adversarial = [r for r in records if r["is_adversarial"]]
+    summary: dict = {"items": len(scored)}
+
+    for metric in METRICS:
+        values = [r[metric] for r in scored if r.get(metric) is not None]
+        summary[metric] = sum(values) / len(values) if values else None
+        summary[f"{metric}_n"] = len(values)
+
+    judged = [r["abstained"] for r in adversarial if r.get("abstained") is not None]
+    summary["abstention_rate"] = sum(judged) / len(judged) if judged else None
+    summary["abstention_n"] = len(judged)
+
+    matches = [r["ticker_match_rate"] for r in scored if r["ticker_match_rate"] is not None]
+    summary["ticker_match_rate"] = sum(matches) / len(matches) if matches else None
+    return summary
+
+
+def aggregate(run_summaries: list[dict]) -> dict:
+    """Mean and spread of each run-level metric across runs."""
+    out: dict = {"runs": len(run_summaries), "items": run_summaries[0]["items"]}
+    for key in (*METRICS, "abstention_rate", "ticker_match_rate"):
+        values = [s[key] for s in run_summaries if s[key] is not None]
+        out[key] = round(statistics.mean(values), 4) if values else None
+        out[f"{key}_std"] = round(statistics.stdev(values), 4) if len(values) > 1 else 0.0
+    for metric in METRICS:
+        out[f"{metric}_n"] = [s[f"{metric}_n"] for s in run_summaries]
+    return out
+
+
+def _fmt(value) -> str:
+    return f"{value:.2f}" if isinstance(value, (int, float)) else "N/A"
+
+
+async def run_eval(
+    runs: int = 3,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
+    limit: int | None = None,
+    ids: list[str] | None = None,
+) -> dict:
+    """Evaluate the golden set, or a subset of it, and gate on the mean scores.
+
+    Args:
+        runs: Number of passes over the selected items.
+        judge_model: Ollama model used by ragas and the abstention check.
+        limit: Evaluate only the first limit items after id filtering.
+        ids: Evaluate only these golden ids.
+
+    Returns:
+        Report dict. partial is True when limit or ids narrowed the set,
+        in which case the scores are not comparable to a full run.
+    """
+    all_items = load_golden_dataset()
+    items = select_items(all_items, limit, ids)
+    partial = len(items) < len(all_items)
+
     setup_tracing()
     await init_pool()
     await init_qdrant()
     await init_client()
+    init_encoder()
+    init_reranker()
+    neo4j_driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH)
 
-    dataset_items = load_golden_dataset()
     thresholds = load_thresholds()
-    results = []
+    judge = functools.partial(complete, model=judge_model, temperature=0.0)
+    scorer = RagasScorer(judge_model)
+    all_records: list[dict] = []
+    run_summaries: list[dict] = []
 
     try:
-        for item in dataset_items:
-            result = await _run_single_item(item)
-            results.append(result)
+        configs = await load_tenant_configs({item["team"] for item in items})
+        orchestrator = build_orchestrator(neo4j_driver)
+
+        for run in range(runs):
+            records = []
+            for item in items:
+                record = await evaluate_item(item, orchestrator, configs[item["team"]], judge, scorer)
+                record["run"] = run
+                records.append(record)
+                logger.info(
+                    "run=%d %s cp=%s cr=%s f=%s ar=%s abst=%s tickers=%s chunks=%d",
+                    run,
+                    record["id"],
+                    _fmt(record.get("context_precision")),
+                    _fmt(record.get("context_recall")),
+                    _fmt(record.get("faithfulness")),
+                    _fmt(record.get("answer_relevancy")),
+                    record.get("abstained", "-"),
+                    _fmt(record["ticker_match_rate"]),
+                    record["chunks_used"],
+                )
+            run_summaries.append(summarize_run(records))
+            all_records.extend(records)
     finally:
+        await neo4j_driver.close()
+        close_reranker()
+        close_encoder()
         await close_client()
         await close_qdrant()
         await close_pool()
 
-    non_adversarial = [r for r in results if not r.get("is_adversarial")]
-
-    def _avg(metric: str, subset: list) -> float:
-        vals = [r[metric] for r in subset if r.get(metric) is not None]
-        return round(sum(vals) / len(vals), 4) if vals else 0.0
-
-    summary = {
-        "context_precision": _avg("context_precision", non_adversarial),
-        "context_recall": _avg("context_recall", non_adversarial),
-        "faithfulness": _avg("faithfulness", non_adversarial),
-        "answer_relevancy": _avg("answer_relevancy", non_adversarial),
-        "total_queries": len(non_adversarial),
-        "adversarial_excluded": len(results) - len(non_adversarial),
-    }
-
+    summary = aggregate(run_summaries)
     passed = all(
-        summary[metric] >= thresholds.get(metric, 0.0)
-        for metric in ["context_precision", "context_recall", "faithfulness", "answer_relevancy"]
+        summary[metric] is not None and summary[metric] >= thresholds.get(metric, 0.0)
+        for metric in METRICS
         if metric in thresholds
     )
 
     return {
-        "results": results,
+        "judge_model": judge_model,
+        "partial": partial,
+        "item_ids": [item["id"] for item in items],
         "summary": summary,
+        "run_summaries": run_summaries,
         "thresholds": thresholds,
         "passed": passed,
+        "results": all_records,
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Run the eval from the command line, print a summary, and save the full report."""
+    parser = argparse.ArgumentParser(description="FinSight offline eval")
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--ids", nargs="+", default=None)
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-    report = asyncio.run(run_eval())
+    report = asyncio.run(
+        run_eval(runs=args.runs, judge_model=args.judge_model, limit=args.limit, ids=args.ids)
+    )
 
-    print("\nRAGAS-Equivalent Eval Results")
-    print("=" * 50)
+    RESULTS_DIR.mkdir(exist_ok=True)
+    prefix = "partial" if report["partial"] else "eval"
+    out_path = RESULTS_DIR / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+
     summary = report["summary"]
-    thresholds = report["thresholds"]
-
-    for metric in ["context_precision", "context_recall", "faithfulness", "answer_relevancy"]:
-        val = summary[metric]
-        threshold = thresholds.get(metric, 0.0)
-        status = "PASS" if val >= threshold else "FAIL"
-        print(f"  {status}  {metric:<22} {val:.3f}  (threshold: {threshold:.2f})")
-
-    print(f"\n  total queries evaluated: {summary['total_queries']}")
-    print(f"  adversarial excluded:    {summary['adversarial_excluded']}")
-    print(f"  overall: {'PASSED' if report['passed'] else 'FAILED'}")
-
-    print("\nPer-item breakdown:")
-    for r in report["results"]:
-        def fmt(v):
-            return f"{v:.2f}" if v is not None else "N/A"
-        adv = " [adversarial]" if r.get("is_adversarial") else ""
+    print(f"\nFull pipeline eval, judge={report['judge_model']}, runs={summary['runs']}, items={summary['items']}")
+    if report["partial"]:
+        print(f"  PARTIAL RUN on {report['item_ids']}, not comparable to a full run")
+    for metric in METRICS:
+        value = summary[metric]
+        threshold = report["thresholds"].get(metric, 0.0)
+        status = "PASS" if value is not None and value >= threshold else "FAIL"
         print(
-            f"  {r['id']:<22} "
-            f"cp={fmt(r['context_precision'])} "
-            f"cr={fmt(r['context_recall'])} "
-            f"f={fmt(r['faithfulness'])} "
-            f"ar={fmt(r['answer_relevancy'])} "
-            f"chunks={r['chunks_retrieved']}{adv}"
+            f"  {status}  {metric:<20} {_fmt(value)} +/- {_fmt(summary[f'{metric}_std'])}"
+            f"  n per run={summary[f'{metric}_n']}  threshold={threshold:.2f}"
         )
+    print(f"  abstention rate (adversarial)  {_fmt(summary['abstention_rate'])}")
+    print(f"  ticker match rate              {_fmt(summary['ticker_match_rate'])}")
+    print(f"  overall: {'PASSED' if report['passed'] else 'FAILED'}")
+    print(f"  full report: {out_path}")
+
+
+if __name__ == "__main__":
+    main()

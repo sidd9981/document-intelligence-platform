@@ -1,7 +1,7 @@
 """
 Qdrant vector store client wrapper.
 
-All vector search and upsert operations go through this module.
+All vector search, upsert and delete operations go through this module.
 Direct use of the Qdrant client outside this file is not permitted.
 
 Responsibilities of this wrapper:
@@ -11,9 +11,9 @@ Responsibilities of this wrapper:
       cannot accidentally omit it.
     - OTEL span creation on every operation so latency and result
       counts are visible in traces without each caller doing it.
-    - Consistent error handling so Qdrant-specific exceptions are
-      caught at one boundary and converted to structured AgentError
-      objects rather than propagating raw client exceptions.
+
+Qdrant client exceptions propagate to the caller. The retrieval agent
+catches them and converts them into structured AgentError objects.
 """
 
 from qdrant_client import AsyncQdrantClient
@@ -21,6 +21,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    FilterSelector,
     MatchAny,
     MatchValue,
     PointStruct,
@@ -34,6 +35,9 @@ from finsight.models.base import Chunk, ChunkMetadata
 from finsight.telemetry.tracing import get_tracer
 
 tracer = get_tracer(__name__)
+
+SPARSE_VECTOR_NAME = "sparse"
+SCROLL_PAGE_SIZE = 256
 
 _client: AsyncQdrantClient | None = None
 
@@ -92,18 +96,16 @@ async def ensure_collections_exist() -> None:
     """Create Qdrant collections if they do not already exist.
 
     Called at startup after init_client(). Safe to call multiple
-    times — existing collections are left unchanged.
+    times, existing collections are left unchanged.
 
     Two collections are created:
-        dense: stores embeddings from nomic-embed-text (768-dim in
-               Phase 1, BAAI/bge-m3 at 1024-dim from Phase 3).
-        sparse: stores SPLADE sparse vectors for keyword matching.
-               Created as a named vector collection. Populated
-               from Phase 3 onwards.
+        dense: stores embeddings from nomic-embed-text (768-dim).
+        sparse: stores SPLADE sparse vectors under the named vector
+                SPARSE_VECTOR_NAME, keyed by the same point ids as the
+                dense collection so RRF can fuse results by chunk_id.
 
-    Cosine distance is used for both collections. For normalized
-    embeddings cosine and dot product are equivalent, but cosine
-    is more intuitive and widely used in retrieval literature.
+    Cosine distance is used for the dense collection. For normalized
+    embeddings cosine and dot product are equivalent.
     """
     client = get_client()
 
@@ -125,7 +127,7 @@ async def ensure_collections_exist() -> None:
                 collection_name=settings.qdrant.collection_sparse,
                 vectors_config={},
                 sparse_vectors_config={
-                    "sparse": SparseVectorParams()
+                    SPARSE_VECTOR_NAME: SparseVectorParams()
                 },
             )
 
@@ -133,9 +135,9 @@ async def ensure_collections_exist() -> None:
 async def upsert_chunks(chunks: list[dict]) -> None:
     """Write chunks to the dense vector collection.
 
-    Uses upsert semantics — running the same document through ingestion
-    twice produces identical chunk IDs and overwrites rather than
-    duplicating entries.
+    Uses upsert semantics, so writing a chunk_id that already exists
+    overwrites it rather than creating a duplicate. Idempotency across
+    re-ingestion therefore depends on callers producing stable chunk ids.
 
     Args:
         chunks: List of dicts with chunk_id, embedding, content, metadata.
@@ -170,8 +172,8 @@ async def upsert_sparse_chunks(chunks: list[dict]) -> None:
     """Write chunks to the sparse vector collection.
 
     Same structure as upsert_chunks but stores SPLADE sparse vectors
-    instead of dense embeddings. Queried in parallel with the dense
-    collection during hybrid retrieval.
+    under the named vector SPARSE_VECTOR_NAME. Point ids must match the
+    dense collection so hybrid retrieval can fuse the two result lists.
 
     Args:
         chunks: List of dicts with chunk_id, sparse_vector, content, metadata.
@@ -184,10 +186,12 @@ async def upsert_sparse_chunks(chunks: list[dict]) -> None:
         points = [
             PointStruct(
                 id=chunk["chunk_id"],
-                vector=SparseVector(
-                    indices=list(chunk["sparse_vector"].keys()),
-                    values=list(chunk["sparse_vector"].values()),
-                ),
+                vector={
+                    SPARSE_VECTOR_NAME: SparseVector(
+                        indices=list(chunk["sparse_vector"].keys()),
+                        values=list(chunk["sparse_vector"].values()),
+                    )
+                },
                 payload={
                     "content": chunk["content"],
                     **chunk["metadata"],
@@ -205,10 +209,90 @@ async def upsert_sparse_chunks(chunks: list[dict]) -> None:
         span.set_attribute("collection", settings.qdrant.collection_sparse)
 
 
+async def scroll_dense(batch_size: int, offset=None) -> tuple[list, object]:
+    """Return one page of dense points with payloads, plus the next page offset.
+
+    Used by maintenance jobs such as the sparse backfill. The returned
+    offset is None when there are no more pages.
+    """
+    client = get_client()
+
+    with tracer.start_as_current_span("qdrant.scroll_dense") as span:
+        span.set_attribute("batch_size", batch_size)
+
+        points, next_offset = await client.scroll(
+            collection_name=settings.qdrant.collection_dense,
+            limit=batch_size,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        span.set_attribute("points.count", len(points))
+        return points, next_offset
+
+
+async def list_doc_ids() -> set[str]:
+    """Return every doc_id present in the dense collection."""
+    client = get_client()
+    doc_ids: set[str] = set()
+    offset = None
+
+    with tracer.start_as_current_span("qdrant.list_doc_ids") as span:
+        while True:
+            points, offset = await client.scroll(
+                collection_name=settings.qdrant.collection_dense,
+                limit=SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_payload=["doc_id"],
+                with_vectors=False,
+            )
+            doc_ids.update(p.payload["doc_id"] for p in points if p.payload and p.payload.get("doc_id"))
+            if offset is None:
+                break
+
+        span.set_attribute("doc_ids.count", len(doc_ids))
+        return doc_ids
+
+
+def _doc_filter(doc_id: str) -> Filter:
+    return Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])
+
+
+async def count_document_chunks(doc_id: str) -> dict[str, int]:
+    """Count one document's chunks in each collection."""
+    client = get_client()
+    counts: dict[str, int] = {}
+
+    for collection in (settings.qdrant.collection_dense, settings.qdrant.collection_sparse):
+        result = await client.count(
+            collection_name=collection,
+            count_filter=_doc_filter(doc_id),
+            exact=True,
+        )
+        counts[collection] = result.count
+    return counts
+
+
+async def delete_document(doc_id: str) -> None:
+    """Delete every chunk of one document from both collections."""
+    client = get_client()
+
+    with tracer.start_as_current_span("qdrant.delete_document") as span:
+        span.set_attribute("doc_id", doc_id)
+
+        for collection in (settings.qdrant.collection_dense, settings.qdrant.collection_sparse):
+            await client.delete(
+                collection_name=collection,
+                points_selector=FilterSelector(filter=_doc_filter(doc_id)),
+                wait=True,
+            )
+
+
 def _build_filter(team_id: str, ticker: str | None) -> Filter:
     """Build a Qdrant filter enforcing scope and optional ticker constraints.
 
-    Scope filtering is mandatory on every search — a missing scope filter
+    Scope filtering is mandatory on every search, a missing scope filter
     would allow a tenant to see documents they are not authorized to see.
     Ticker filtering is optional and used when the query is company-specific.
 
@@ -275,8 +359,7 @@ async def search_dense(
     """Search the dense vector collection.
 
     Scope filtering is mandatory. When ticker is provided, results are
-    further restricted to that company — prevents cross-company
-    contamination in both production queries and eval runs.
+    further restricted to that company.
 
     Args:
         query_embedding: The embedded query vector.
@@ -315,9 +398,8 @@ async def search_sparse(
 ) -> list[Chunk]:
     """Search the sparse vector collection.
 
-    Same scope and ticker filtering as search_dense — tenant isolation
-    is enforced at the data layer on every search operation regardless
-    of retrieval method.
+    Same scope and ticker filtering as search_dense, so tenant isolation
+    is enforced at the data layer regardless of retrieval method.
 
     Args:
         sparse_vector: SPLADE sparse vector from encode_sparse().
@@ -343,7 +425,7 @@ async def search_sparse(
                 indices=list(sparse_vector.keys()),
                 values=list(sparse_vector.values()),
             ),
-            using="sparse",
+            using=SPARSE_VECTOR_NAME,
             query_filter=_build_filter(team_id, ticker),
             limit=k,
             with_payload=True,
