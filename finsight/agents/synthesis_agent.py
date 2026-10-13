@@ -8,7 +8,13 @@ output harness.
 
 The model cites sources as [1], [2]. Short numeric markers are far more
 reliable for small models than copying long chunk ids, and each number
-maps back to exactly one chunk.
+maps back to exactly one chunk. Square brackets are reserved for
+citations, so the prompt forbids bracketed list numbering, which would
+otherwise be misread as citations.
+
+The prompt asks for a direct answer in the model's own words. Without
+that instruction, smaller models tend to paste source passages verbatim,
+which reads as noncommittal and inflates faithfulness scores.
 """
 
 from __future__ import annotations
@@ -28,12 +34,14 @@ from finsight.telemetry.tracing import get_tracer
 logger = logging.getLogger(__name__)
 tracer = get_tracer(__name__)
 
-PROMPT_VERSION = "synthesis_v2"
+PROMPT_VERSION = "synthesis_v3"
 CLAIM_WINDOW_CHARS = 200
 
 SYSTEM_PROMPT = """You are a financial document analyst. Answer the question using only the numbered sources provided.
 
-Cite every factual claim with its source number in square brackets, for example [1] or [2][4].
+Write the answer in your own words. Start with one sentence that directly answers the question, then give the supporting details. Summarize what the sources say. Do not copy passages verbatim and do not quote long excerpts.
+
+End each sentence that makes a factual claim with the number of the source that supports it, in square brackets, for example [3] or [2][5]. Use square brackets only for citations. For lists, start each item with a hyphen, never with a number in brackets.
 
 Rules:
 - Only use information from the provided sources

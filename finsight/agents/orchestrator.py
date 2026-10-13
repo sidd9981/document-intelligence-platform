@@ -7,6 +7,11 @@ context in the input harness, synthesize, validate in the output harness,
 and build the response. Every edge is explicit. Failure paths are part
 of the graph rather than improvised at runtime.
 
+Entity extraction resolves company names and ticker symbols. When the
+question names exactly one company in the corpus, retrieval is
+restricted to that company's filings, which stops passages from other
+companies leaking into the context.
+
 The state object is the single source of truth. Nodes read from it and
 write back to it. Components never call each other directly. errors uses
 an additive reducer so both parallel branches can record failures
@@ -55,6 +60,14 @@ tracer = get_tracer(__name__)
 
 LOW_FAITHFULNESS_THRESHOLD = 0.85
 
+COMPANY_TICKERS = {
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "tesla": "TSLA",
+}
+CORPUS_TICKERS = frozenset(COMPANY_TICKERS.values())
+
+_COMPANY_PATTERN = re.compile(r"\b(" + "|".join(COMPANY_TICKERS) + r")\b", re.IGNORECASE)
 _TICKER_PATTERN = re.compile(r"(?<![\w$])\$?([A-Z]{2,5})\b")
 _NON_TICKERS = frozenset({
     "AI", "CEO", "CFO", "COO", "CTO", "EU", "ESG", "FY", "GAAP", "IPO",
@@ -70,6 +83,7 @@ class AgentState(TypedDict):
 
     intent: str
     entities: list[str]
+    ticker_filter: str | None
     conversation_context: str | None
 
     retrieval_result: RetrievalResult | None
@@ -101,6 +115,7 @@ def _initial_state(
         trace_id=trace_id,
         intent="factual",
         entities=[],
+        ticker_filter=None,
         conversation_context=conversation_context,
         retrieval_result=None,
         graph_result=None,
@@ -115,6 +130,17 @@ def _initial_state(
         cache_hit=False,
         final_response=None,
     )
+
+
+def resolve_ticker_filter(entities: list[str]) -> str | None:
+    """Return the single corpus ticker to filter on, or None.
+
+    The filter applies only when the question names exactly one company
+    in the corpus. Questions naming several companies, or none, search
+    across all filings.
+    """
+    in_corpus = [e for e in entities if e in CORPUS_TICKERS]
+    return in_corpus[0] if len(in_corpus) == 1 else None
 
 
 class Orchestrator:
@@ -211,6 +237,8 @@ class Orchestrator:
             span.set_attribute("intent", final_state["intent"])
             span.set_attribute("graph_used", final_state["graph_used"])
             span.set_attribute("errors.count", len(final_state["errors"]))
+            if final_state["ticker_filter"]:
+                span.set_attribute("ticker_filter", final_state["ticker_filter"])
 
             synthesis = final_state.get("synthesis_result")
             retrieval = final_state.get("retrieval_result")
@@ -220,6 +248,7 @@ class Orchestrator:
                     query=query,
                     team_id=tenant_config.team_id,
                     chunks=retrieval.chunks,
+                    ticker=final_state["ticker_filter"],
                 )
 
             if synthesis and retrieval:
@@ -295,22 +324,27 @@ class Orchestrator:
         return {"intent": intent}
 
     async def _extract_entities(self, state: AgentState) -> dict:
-        """Extract ticker-like symbols from the raw query.
+        """Extract company tickers from the raw query by name and by symbol.
 
-        Matches 2 to 5 uppercase letters, optionally prefixed with $, at any
-        position including before punctuation or at the end of the query.
-        Common uppercase abbreviations such as SEC or CEO are excluded.
-        Runs on the current question only, so a ticker from an earlier turn
-        cannot leak into this turn.
+        Company names in COMPANY_TICKERS resolve case-insensitively to their
+        ticker, so "Apple" and "apple" both become AAPL. Explicit symbols of
+        2 to 5 uppercase letters, optionally prefixed with $, are also kept,
+        minus common abbreviations such as SEC or CEO. Runs on the current
+        question only, so a company from an earlier turn cannot leak into
+        this turn's filter.
         """
-        found = {m.group(1) for m in _TICKER_PATTERN.finditer(state["query"])}
-        return {"entities": sorted(found - _NON_TICKERS)}
+        query = state["query"]
+        from_names = {COMPANY_TICKERS[m.group(1).lower()] for m in _COMPANY_PATTERN.finditer(query)}
+        from_symbols = {m.group(1) for m in _TICKER_PATTERN.finditer(query)} - _NON_TICKERS
+        entities = sorted(from_names | from_symbols)
+        return {"entities": entities, "ticker_filter": resolve_ticker_filter(entities)}
 
     async def _invoke_retrieval_agent(self, state: AgentState) -> dict:
         result = await self._retrieval_agent.retrieve(
             query=state["query"],
             tenant_config=state["tenant_config"],
             trace_id=state["trace_id"],
+            ticker=state["ticker_filter"],
         )
         logger.debug("retrieval complete chunks=%d errors=%d", len(result.chunks), len(result.errors))
         return {
